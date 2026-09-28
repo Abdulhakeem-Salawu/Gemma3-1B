@@ -1,0 +1,10 @@
+steps:
+  # Pull the previous image so unchanged layers (the llama.cpp compile) are reused.
+  - name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: ['-c', 'docker pull $_IMAGE || true']
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '--cache-from', '$_IMAGE', '-t', '$_IMAGE', '.']
+images: ['$_IMAGE']
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/pioneering-axe-233302/cloud-run-source-deploy/gemma-agent

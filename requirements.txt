@@ -5,3 +5,5 @@ llama-cpp-python
 mcp
 yfinance
 ddgs
+requests
+beautifulsoup4

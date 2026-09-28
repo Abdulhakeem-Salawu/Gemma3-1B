@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # cost, avoids "illegal instruction" crashes at runtime.
 ENV CMAKE_ARGS="-DGGML_NATIVE=OFF"
 
+# Slow compile in its own layer so later dependency/code changes rebuild in
+# about a minute instead of ~15.
+RUN pip install --no-cache-dir llama-cpp-python
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

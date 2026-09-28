@@ -99,6 +99,7 @@ const dot = document.getElementById("dot");
 const status = document.getElementById("status");
 
 let history = [];
+let busy = false;
 
 function addMessage(role, content) {
   const div = document.createElement("div");
@@ -113,11 +114,13 @@ function addMessage(role, content) {
 }
 
 async function send(text) {
+  if (busy) return;               // never overlap requests: the server handles one at a time
+  busy = true;
   history.push({ role: "user", content: text });
   addMessage("user", text);
   input.value = "";
   sendBtn.disabled = true;
-  status.textContent = "thinking…";
+  status.textContent = "thinking… (the first reply after a quiet spell can take a minute or two)";
 
   try {
     const res = await fetch("/chat", {
@@ -125,7 +128,12 @@ async function send(text) {
       headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
       body: JSON.stringify({ messages: history }),
     });
-    if (!res.ok) throw new Error(await res.text());
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(res.status === 429
+        ? "The model is busy or still waking up. Wait a few seconds and resend."
+        : res.status === 401 ? "Wrong password." : body);
+    }
     const data = await res.json();
     if (data.tool_trace) {
       for (const t of data.tool_trace) addMessage("tool", `[tool] ${t}`);
@@ -135,10 +143,13 @@ async function send(text) {
     dot.classList.remove("off");
     status.textContent = "ready";
   } catch (err) {
+    history.pop();                // drop the unanswered question so roles keep alternating
+    input.value = text;           // put it back so it can simply be resent
     addMessage("tool", "Error: " + err.message);
     dot.classList.add("off");
     status.textContent = "error";
   } finally {
+    busy = false;
     sendBtn.disabled = false;
     input.focus();
   }
@@ -147,7 +158,7 @@ async function send(text) {
 form.addEventListener("submit", (e) => {
   e.preventDefault();
   const text = input.value.trim();
-  if (text) send(text);
+  if (text && !busy) send(text);
 });
 
 input.addEventListener("keydown", (e) => {
