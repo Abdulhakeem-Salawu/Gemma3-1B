@@ -234,7 +234,7 @@ You also have these tools:
 {tools}
 
 Rules:
-- Greetings, general questions: answer directly with action "final_answer". Do not use a tool.
+- Greetings, small talks, general questions: answer directly with action "final_answer". Do not use a tool.
 - Use "tool_call" ONLY when the user asks for current prices, market data or recent news/facts that a tool can fetch.
 - Never invent prices, dates or news. If it did not come from a tool result, do not state it.
 - Keep answers short.
