@@ -314,7 +314,7 @@ def run_completion(llm: Llama, turns: list[dict]) -> dict:
             messages=turns,
             response_format={"type": "json_object", "schema": DECISION_SCHEMA},
             temperature=0.2,
-            max_tokens=400,
+            max_tokens=5000,
         )
 
 
