@@ -16,17 +16,29 @@ chat UI, with tool calling and MCP server access, deployable to Cloud Run.
 
 1. Accept the license and download `gemma-3-1b-it-q4_0.gguf` from
    `google/gemma-3-1b-it-qat-q4_0-gguf` on Hugging Face.
-2. Upload it to a bucket: `gsutil cp gemma-3-1b-it-q4_0.gguf gs://YOUR_BUCKET/`
-3. Build: `gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT/REPO/gemma-agent`
-4. Deploy:
+2. Upload it to your bucket: `gcloud storage cp gemma-3-1b-it-q4_0.gguf gs://YOUR_BUCKET/`
+3. Build straight from this repo (the llama.cpp compile takes ~15 min):
+   ```
+   gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
+     --git-source-revision=main --region=us-central1 \
+     --tag=us-central1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/gemma-agent
+   ```
+4. Deploy (`--concurrency=1` matters: one llama.cpp instance isn't safe to
+   share between simultaneous requests):
    ```
    gcloud run deploy gemma-agent \
-     --image REGION-docker.pkg.dev/PROJECT/REPO/gemma-agent \
-     --region us-central1 --cpu 4 --memory 4Gi \
-     --add-volume mount-path=/mnt/models,type=cloud-storage,bucket=YOUR_BUCKET,readonly=true \
-     --set-env-vars MODEL_PATH=/mnt/models/gemma-3-1b-it-q4_0.gguf,APP_API_KEY=pick-a-secret,MCP_SERVER_URLS=https://your-mcp-server/sse \
+     --image us-central1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/gemma-agent \
+     --region us-central1 --execution-environment gen2 \
+     --cpu 4 --memory 4Gi --cpu-boost --concurrency 1 --timeout 600 \
+     --add-volume name=models,type=cloud-storage,bucket=YOUR_BUCKET,readonly=true \
+     --add-volume-mount volume=models,mount-path=/mnt/models \
+     --set-env-vars MODEL_PATH=/mnt/models/gemma-3-1b-it-q4_0.gguf,APP_API_KEY=pick-a-secret \
      --allow-unauthenticated
    ```
 
-Add business-intelligence tools later by adding a function + JSON-schema
-entry to `BUILTIN_TOOLS` in `app.py` — nothing else needs to change.
+Optional env var: `MCP_SERVER_URLS` (comma-separated SSE URLs). Be careful
+which servers you attach — the model reads untrusted web text, so don't give
+it a tool that can change infrastructure.
+
+Add business-intelligence tools by adding a function + JSON-schema entry to
+`BUILTIN_TOOLS` in `app.py` — nothing else needs to change.
