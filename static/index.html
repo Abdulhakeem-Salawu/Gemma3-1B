@@ -101,6 +101,8 @@ const status = document.getElementById("status");
 let history = [];
 let busy = false;
 
+// Returns the message element and its text node, so a streaming reply can
+// keep appending to the same node instead of re-rendering the message.
 function addMessage(role, content) {
   const div = document.createElement("div");
   div.className = "msg " + role;
@@ -108,9 +110,11 @@ function addMessage(role, content) {
   label.className = "role";
   label.textContent = role;
   div.appendChild(label);
-  div.appendChild(document.createTextNode(content));
+  const node = document.createTextNode(content);
+  div.appendChild(node);
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
+  return { div, node };
 }
 
 async function send(text) {
@@ -122,8 +126,11 @@ async function send(text) {
   sendBtn.disabled = true;
   status.textContent = "thinking… (the first reply after a quiet spell can take a minute or two)";
 
+  let bubble = null;              // assistant message, created when the first token arrives
+  let reply = "";
+
   try {
-    const res = await fetch("/chat", {
+    const res = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
       body: JSON.stringify({ messages: history }),
@@ -134,16 +141,51 @@ async function send(text) {
         ? "The model is busy or still waking up. Wait a few seconds and resend."
         : res.status === 401 ? "Wrong password." : body);
     }
-    const data = await res.json();
-    if (data.tool_trace) {
-      for (const t of data.tool_trace) addMessage("tool", `[tool] ${t}`);
+
+    // Server-sent events: frames look like `data: {...}` separated by a blank line.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finished = false;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let end;
+      while ((end = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        if (!frame.startsWith("data: ")) continue;
+        const evt = JSON.parse(frame.slice(6));
+
+        if (evt.type === "tool") {
+          addMessage("tool", `[tool] ${evt.text}`);
+          status.textContent = "using a tool…";
+        } else if (evt.type === "token") {
+          if (!bubble) {
+            bubble = addMessage("assistant", "");
+            status.textContent = "replying…";
+          }
+          reply += evt.text;
+          bubble.node.appendData(evt.text);
+          log.scrollTop = log.scrollHeight;
+        } else if (evt.type === "error") {
+          throw new Error(evt.text);
+        } else if (evt.type === "done") {
+          finished = true;
+        }
+      }
     }
-    addMessage("assistant", data.reply);
-    history.push({ role: "assistant", content: data.reply });
+
+    if (!finished) throw new Error("Connection dropped before the reply finished.");
+    history.push({ role: "assistant", content: reply });
     dot.classList.remove("off");
     status.textContent = "ready";
   } catch (err) {
     history.pop();                // drop the unanswered question so roles keep alternating
+    if (bubble) bubble.div.remove();  // and any half-written reply
     input.value = text;           // put it back so it can simply be resent
     addMessage("tool", "Error: " + err.message);
     dot.classList.add("off");
