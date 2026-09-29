@@ -33,6 +33,17 @@
     color: var(--dim);
     letter-spacing: 0.02em;
   }
+  header .spacer { flex: 1; }
+  header button.link {
+    background: none;
+    color: var(--dim);
+    border: 1px solid var(--line);
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 400;
+    border-radius: 3px;
+  }
+  header button.link:hover { color: var(--text); border-color: var(--dim); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); }
   .dot.off { background: #5a2323; box-shadow: none; }
   main {
@@ -48,8 +59,53 @@
   .msg.user .role { color: var(--amber); }
   .msg.assistant .role { color: var(--green); }
   .msg.tool { color: var(--dim); font-size: 13px; border-left: 2px solid var(--line); padding-left: 10px; }
+  .msg.thinking {
+    color: var(--dim);
+    font-size: 13px;
+    font-style: italic;
+    border-left: 2px dashed var(--line);
+    padding-left: 10px;
+  }
+  .msg.thinking .role { color: var(--dim); }
+
+  .docs {
+    max-width: 760px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 0 18px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--dim);
+  }
+  .docs.empty { display: none; }
+  .chip {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 3px 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .chip .n { color: var(--green); }
+  .docs-actions { margin-left: auto; display: flex; gap: 8px; }
+  .docs-actions button.link {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--dim);
+    padding: 3px 8px;
+    font-size: 12px;
+    border-radius: 3px;
+  }
+  .docs-actions button.link:hover { color: var(--text); }
+  .docs-status { font-size: 12px; color: var(--dim); padding: 4px 18px 0; max-width: 760px; margin: 0 auto; width: 100%; }
+
   form {
     display: flex;
+    align-items: flex-end;
     gap: 10px;
     padding: 14px 18px 20px;
     max-width: 760px;
@@ -72,18 +128,40 @@
     color: #1a1200;
     border: none;
     padding: 0 18px;
+    height: 38px;
     border-radius: 4px;
     font: inherit;
     font-weight: 600;
     cursor: pointer;
   }
   button:disabled { opacity: 0.4; cursor: default; }
+  button.upload {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--line);
+    font-weight: 400;
+    padding: 0 14px;
+  }
+  button.upload:hover { border-color: var(--amber); }
+  input[type=file] { display: none; }
 </style>
 </head>
 <body>
-<header><span class="dot" id="dot"></span><span id="status">ready</span></header>
+<header>
+  <span class="dot" id="dot"></span><span id="status">ready</span>
+  <span class="spacer"></span>
+  <button class="link" id="newChatBtn" type="button">New chat</button>
+</header>
+<div class="docs empty" id="docsPanel">
+  <span>docs:</span>
+  <span id="docsChips"></span>
+  <span class="docs-actions"><button class="link" id="clearDocsBtn" type="button">clear docs</button></span>
+</div>
+<div class="docs-status" id="docsStatus"></div>
 <main id="log"></main>
 <form id="form">
+  <input type="file" id="fileInput" accept=".pdf,.docx,.txt,.md" />
+  <button class="upload" id="uploadBtn" type="button" title="Attach a PDF, DOCX, TXT or MD file for the model to use as context">+ doc</button>
   <textarea id="input" rows="1" placeholder="Ask something…"></textarea>
   <button id="send">Send</button>
 </form>
@@ -91,15 +169,67 @@
 const API_KEY = localStorage.getItem("agent_api_key") || prompt("API key for this agent (leave blank if none set):") || "";
 localStorage.setItem("agent_api_key", API_KEY);
 
+// A session id ties uploaded documents to this browser's conversation. It is
+// generated once and kept in localStorage so a reload keeps the same
+// documents available (as long as the server process hasn't restarted —
+// see checkInstance() below, which detects that and says so).
+const SESSION_KEY = "agent_session_id";
+function newSessionId() {
+  return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+}
+let sessionId = localStorage.getItem(SESSION_KEY);
+if (!sessionId) {
+  sessionId = newSessionId();
+  localStorage.setItem(SESSION_KEY, sessionId);
+}
+
+const HISTORY_KEY = "agent_history";
+const DOCS_KEY = "agent_docs";
+const INSTANCE_KEY = "agent_instance_id";
+
 const log = document.getElementById("log");
 const form = document.getElementById("form");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const dot = document.getElementById("dot");
 const status = document.getElementById("status");
+const newChatBtn = document.getElementById("newChatBtn");
+const fileInput = document.getElementById("fileInput");
+const uploadBtn = document.getElementById("uploadBtn");
+const docsPanel = document.getElementById("docsPanel");
+const docsChips = document.getElementById("docsChips");
+const docsStatus = document.getElementById("docsStatus");
+const clearDocsBtn = document.getElementById("clearDocsBtn");
 
+// history is exactly what gets sent to the model as conversation so far —
+// only real user/assistant turns, never "thinking" scratch text or tool
+// traces (those are per-turn UI feedback, not part of the conversation the
+// model should be replayed).
 let history = [];
+let uploadedDocs = [];  // [{name, chunks}] — display only, mirrors what the server has for this session
 let busy = false;
+
+function loadState() {
+  try { history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); } catch (e) { history = []; }
+  try { uploadedDocs = JSON.parse(localStorage.getItem(DOCS_KEY) || "[]"); } catch (e) { uploadedDocs = []; }
+}
+function saveHistory() { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); }
+function saveDocs() { localStorage.setItem(DOCS_KEY, JSON.stringify(uploadedDocs)); }
+
+function renderDocs() {
+  docsChips.innerHTML = "";
+  if (!uploadedDocs.length) {
+    docsPanel.classList.add("empty");
+    return;
+  }
+  docsPanel.classList.remove("empty");
+  for (const d of uploadedDocs) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.innerHTML = `${d.name} <span class="n">${d.chunks}</span>`;
+    docsChips.appendChild(chip);
+  }
+}
 
 // Returns the message element and its text node, so a streaming reply can
 // keep appending to the same node instead of re-rendering the message.
@@ -108,7 +238,7 @@ function addMessage(role, content) {
   div.className = "msg " + role;
   const label = document.createElement("span");
   label.className = "role";
-  label.textContent = role;
+  label.textContent = role === "thinking" ? "thinking" : role;
   div.appendChild(label);
   const node = document.createTextNode(content);
   div.appendChild(node);
@@ -117,23 +247,123 @@ function addMessage(role, content) {
   return { div, node };
 }
 
+// Persists a not-yet-finished assistant reply so a reload mid-stream keeps
+// what arrived so far instead of losing the exchange. Throttled — streaming
+// can emit many small pieces per second and localStorage writes are sync.
+let lastPartialSave = 0;
+function savePartialAssistant(text) {
+  const now = Date.now();
+  if (now - lastPartialSave < 400) return;
+  lastPartialSave = now;
+  const snapshot = history.concat([{ role: "assistant", content: text, partial: true }]);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(snapshot));
+}
+
+function renderHistory() {
+  let interrupted = false;
+  history.forEach((m, i) => {
+    const isLast = i === history.length - 1;
+    if (m.partial && isLast) interrupted = true;
+    addMessage(m.role, m.content);
+  });
+  if (interrupted) {
+    const last = history[history.length - 1];
+    addMessage("tool", "[the reply above was cut off by a reload]");
+    delete last.partial;
+    saveHistory();
+  }
+}
+
+// The server keeps uploaded documents in memory only — a restart (scale to
+// zero after being idle, a crash, a new deploy) loses them even though this
+// page's chat history and doc list survive in localStorage. instance_id
+// changes every time the server process starts, so comparing it tells us.
+async function checkInstance() {
+  try {
+    const res = await fetch("/session/init");
+    const data = await res.json();
+    const lastSeen = localStorage.getItem(INSTANCE_KEY);
+    if (lastSeen && lastSeen !== data.instance_id && uploadedDocs.length) {
+      uploadedDocs = [];
+      saveDocs();
+      renderDocs();
+      addMessage("tool", "[notice] The agent restarted since your last visit, which cleared its uploaded documents (chat history is unaffected). Re-upload anything you still need.");
+    }
+    localStorage.setItem(INSTANCE_KEY, data.instance_id);
+  } catch (e) {
+    // non-fatal — skip the check silently rather than blocking the page
+  }
+}
+
+async function uploadFile(file) {
+  uploadBtn.disabled = true;
+  docsStatus.textContent = `uploading ${file.name}…`;
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`/kb/upload?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+      headers: { "x-api-key": API_KEY },
+      body: form,
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || `Upload failed (${res.status})`);
+    uploadedDocs.push({ name: body.filename, chunks: body.total_chunks });
+    saveDocs();
+    renderDocs();
+    docsStatus.textContent = `${file.name}: added ${body.chunks_added} chunk(s)`;
+  } catch (err) {
+    docsStatus.textContent = `${file.name}: ${err.message}`;
+  } finally {
+    uploadBtn.disabled = false;
+  }
+}
+
+async function clearDocs() {
+  docsStatus.textContent = "clearing…";
+  try {
+    await fetch("/kb/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+  } catch (e) { /* best effort — clear the client list regardless */ }
+  uploadedDocs = [];
+  saveDocs();
+  renderDocs();
+  docsStatus.textContent = "";
+}
+
+function resetChat() {
+  if (history.length && !confirm("Start a new chat? This clears the visible conversation and uploaded documents.")) return;
+  history = [];
+  saveHistory();
+  log.innerHTML = "";
+  clearDocs();
+  sessionId = newSessionId();
+  localStorage.setItem(SESSION_KEY, sessionId);
+  status.textContent = "ready";
+}
+
 async function send(text) {
   if (busy) return;               // never overlap requests: the server handles one at a time
   busy = true;
   history.push({ role: "user", content: text });
+  saveHistory();                  // persist the question immediately, before any reply arrives
   addMessage("user", text);
   input.value = "";
   sendBtn.disabled = true;
   status.textContent = "thinking… (the first reply after a quiet spell can take a minute or two)";
 
-  let bubble = null;              // assistant message, created when the first token arrives
+  let thinkingBubble = null;      // reasoning text; a fresh bubble per model turn (tool calls can mean several)
+  let bubble = null;              // assistant message, created when the first answer token arrives
   let reply = "";
 
   try {
-    const res = await fetch("/chat/stream", {
+    const res = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({ messages: history }),
+      body: JSON.stringify({ messages: history, session_id: sessionId }),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -160,7 +390,16 @@ async function send(text) {
         if (!frame.startsWith("data: ")) continue;
         const evt = JSON.parse(frame.slice(6));
 
-        if (evt.type === "tool") {
+        if (evt.type === "thinking") {
+          if (!thinkingBubble) {
+            thinkingBubble = addMessage("thinking", "");
+            status.textContent = "thinking…";
+          }
+          thinkingBubble.node.appendData(evt.text);
+          log.scrollTop = log.scrollHeight;
+        } else if (evt.type === "thinking_done") {
+          thinkingBubble = null;  // a later tool hop starts a new one, kept visually separate
+        } else if (evt.type === "tool") {
           addMessage("tool", `[tool] ${evt.text}`);
           status.textContent = "using a tool…";
         } else if (evt.type === "token") {
@@ -170,6 +409,7 @@ async function send(text) {
           }
           reply += evt.text;
           bubble.node.appendData(evt.text);
+          savePartialAssistant(reply);
           log.scrollTop = log.scrollHeight;
         } else if (evt.type === "error") {
           throw new Error(evt.text);
@@ -181,10 +421,13 @@ async function send(text) {
 
     if (!finished) throw new Error("Connection dropped before the reply finished.");
     history.push({ role: "assistant", content: reply });
+    saveHistory();
     dot.classList.remove("off");
     status.textContent = "ready";
   } catch (err) {
     history.pop();                // drop the unanswered question so roles keep alternating
+    saveHistory();
+    if (thinkingBubble) thinkingBubble.div.remove();
     if (bubble) bubble.div.remove();  // and any half-written reply
     input.value = text;           // put it back so it can simply be resent
     addMessage("tool", "Error: " + err.message);
@@ -209,6 +452,20 @@ input.addEventListener("keydown", (e) => {
     form.requestSubmit();
   }
 });
+
+uploadBtn.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  fileInput.value = "";
+  if (file) uploadFile(file);
+});
+clearDocsBtn.addEventListener("click", clearDocs);
+newChatBtn.addEventListener("click", resetChat);
+
+loadState();
+renderHistory();
+renderDocs();
+checkInstance();
 </script>
 </body>
 </html>
