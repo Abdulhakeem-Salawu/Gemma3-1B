@@ -68,11 +68,20 @@
   }
   .msg.thinking .role { color: var(--dim); }
 
+  /* Composer: the whole bottom compose bar (attached documents + input),
+     visually separated from the scrolling log by its own top border — the
+     doc chips live here now, right above the textarea, instead of floating
+     at the top of the page. */
+  .composer {
+    border-top: 1px solid var(--line);
+    background: var(--bg);
+  }
+
   .docs {
     max-width: 760px;
     width: 100%;
     margin: 0 auto;
-    padding: 0 18px;
+    padding: 10px 18px 0;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -152,19 +161,21 @@
   <span class="spacer"></span>
   <button class="link" id="newChatBtn" type="button">New chat</button>
 </header>
-<div class="docs empty" id="docsPanel">
-  <span>docs:</span>
-  <span id="docsChips"></span>
-  <span class="docs-actions"><button class="link" id="clearDocsBtn" type="button">clear docs</button></span>
-</div>
-<div class="docs-status" id="docsStatus"></div>
 <main id="log"></main>
-<form id="form">
-  <input type="file" id="fileInput" accept=".pdf,.docx,.txt,.md" />
-  <button class="upload" id="uploadBtn" type="button" title="Attach a PDF, DOCX, TXT or MD file for the model to use as context">+ doc</button>
-  <textarea id="input" rows="1" placeholder="Ask something…"></textarea>
-  <button id="send">Send</button>
-</form>
+<div class="composer">
+  <div class="docs empty" id="docsPanel">
+    <span>docs:</span>
+    <span id="docsChips"></span>
+    <span class="docs-actions"><button class="link" id="clearDocsBtn" type="button">clear docs</button></span>
+  </div>
+  <div class="docs-status" id="docsStatus"></div>
+  <form id="form">
+    <input type="file" id="fileInput" accept=".pdf,.docx,.txt,.md" />
+    <button class="upload" id="uploadBtn" type="button" title="Attach a PDF, DOCX, TXT or MD file for the model to use as context">+ doc</button>
+    <textarea id="input" rows="1" placeholder="Ask something…"></textarea>
+    <button id="send">Send</button>
+  </form>
+</div>
 <script>
 const API_KEY = localStorage.getItem("agent_api_key") || prompt("API key for this agent (leave blank if none set):") || "";
 localStorage.setItem("agent_api_key", API_KEY);
