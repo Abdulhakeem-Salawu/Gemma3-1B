@@ -395,7 +395,7 @@ You also have these tools:
 {tools}
 {context_block}
 Rules:
-- First, fill "thinking" with 1-3 short sentences of your own reasoning about how to answer. The user can see this, so keep it brief and relevant — not a full essay.
+- First, fill "thinking" with ONE short sentence (max ~15 words) of your own reasoning about how to answer. The user can see this, so keep it brief.
 - Greetings, general questions: answer directly with action "final_answer". Do not use a tool.
 - Use "tool_call" ONLY when the user asks for current prices, market data or recent news/facts that a tool can fetch.
 - If context from uploaded documents is given above and it answers the question, use it and say so. If it's there but doesn't cover the question, say it doesn't rather than guessing.
