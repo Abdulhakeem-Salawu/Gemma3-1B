@@ -3,6 +3,7 @@ import functools
 import ipaddress
 import json
 import os
+import re
 import socket
 import threading
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama
 from mcp import ClientSession
@@ -308,6 +310,24 @@ def normalize_history(messages: list[dict]) -> list[dict]:
     return clean
 
 
+def build_turns(messages: list[dict]) -> list[dict]:
+    """Client history -> the turns sent to the model (instructions ride on the
+    newest user message). Shared by /chat and /chat/stream."""
+    history = normalize_history(messages[-MAX_HISTORY_MESSAGES:])
+    if not history or history[-1]["role"] != "user":
+        raise HTTPException(status_code=400, detail="Last message must have role 'user'.")
+
+    question = history[-1]["content"]
+    turns = history[:-1]  # everything before the newest question, replayed as-is
+    turns.append(
+        {
+            "role": "user",
+            "content": INSTRUCTIONS_TEMPLATE.format(tools=tool_directory_text(), question=question),
+        }
+    )
+    return turns
+
+
 def run_completion(llm: Llama, turns: list[dict]) -> dict:
     with INFERENCE_LOCK:
         return llm.create_chat_completion(
@@ -324,18 +344,7 @@ async def chat(req: ChatRequest):
     if llm is None:
         raise HTTPException(status_code=503, detail="Model still loading.")
 
-    history = normalize_history(req.messages[-MAX_HISTORY_MESSAGES:])
-    if not history or history[-1]["role"] != "user":
-        raise HTTPException(status_code=400, detail="Last message must have role 'user'.")
-
-    question = history[-1]["content"]
-    turns = history[:-1]  # everything before the newest question, replayed as-is
-    turns.append(
-        {
-            "role": "user",
-            "content": INSTRUCTIONS_TEMPLATE.format(tools=tool_directory_text(), question=question),
-        }
-    )
+    turns = build_turns(req.messages)
 
     loop = asyncio.get_event_loop()
     tool_trace: list[str] = []
@@ -366,6 +375,191 @@ async def chat(req: ChatRequest):
         return {"reply": decision.get("final_answer", ""), "tool_trace": tool_trace}
 
     return {"reply": "Reached the tool-call limit without a final answer — try rephrasing.", "tool_trace": tool_trace}
+
+
+# ---------------------------------------------------------------------------
+# Streaming. Every model turn is a grammar-constrained JSON object, so the
+# tokens that arrive are pieces of JSON, not prose. FinalAnswerStreamer pulls
+# the text of the "final_answer" string out of that JSON as it arrives, and
+# /chat/stream forwards it to the browser as server-sent events.
+# ---------------------------------------------------------------------------
+
+
+class FinalAnswerStreamer:
+    """Decodes the "final_answer" string out of a JSON object that is arriving
+    piece by piece. Only streams when "action" is "final_answer", so a
+    tool-routing turn never leaks text into the chat."""
+
+    _ACTION = re.compile(r'"action"\s*:\s*"(\w+)"')
+    _KEY = re.compile(r'"final_answer"\s*:\s*"')
+    _SIMPLE = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+    def __init__(self):
+        self.buf = ""
+        self.action: str | None = None
+        self.pos: int | None = None  # index just after the opening quote of the value
+        self.done = False
+        self.emitted = False
+
+    def feed(self, chunk: str) -> str:
+        self.buf += chunk
+        if self.done:
+            return ""
+        if self.action is None:
+            m = self._ACTION.search(self.buf)
+            if not m:
+                return ""
+            self.action = m.group(1)
+        if self.action != "final_answer":
+            return ""
+        if self.pos is None:
+            m = self._KEY.search(self.buf)
+            if not m:
+                return ""
+            self.pos = m.end()
+
+        buf, i, out = self.buf, self.pos, []
+        while i < len(buf):
+            c = buf[i]
+            if c == '"':
+                self.done = True
+                i += 1
+                break
+            if c != "\\":
+                out.append(c)
+                i += 1
+                continue
+            if i + 1 >= len(buf):
+                break  # escape sequence split across chunks: wait for the rest
+            n = buf[i + 1]
+            if n in self._SIMPLE:
+                out.append(self._SIMPLE[n])
+                i += 2
+            elif n == "u":
+                if i + 6 > len(buf):
+                    break
+                try:
+                    code = int(buf[i + 2 : i + 6], 16)
+                    if 0xD800 <= code < 0xDC00:  # high surrogate: needs its low half too
+                        if i + 12 > len(buf):
+                            break
+                        low = int(buf[i + 8 : i + 12], 16)
+                        code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                        i += 12
+                    else:
+                        i += 6
+                    out.append(chr(code))
+                except ValueError:
+                    out.append("\ufffd")
+                    i += 6
+            else:
+                out.append(n)
+                i += 2
+        self.pos = i
+        text = "".join(out)
+        if text:
+            self.emitted = True
+        return text
+
+
+def sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+def generate_stream(llm: Llama, turns: list[dict], emit, cancel: threading.Event) -> str:
+    """Runs in a worker thread. Calls emit(piece) for every raw token piece and
+    emit(None) once when the turn is over. Returns the full raw text."""
+    raw: list[str] = []
+    try:
+        with INFERENCE_LOCK:
+            stream = llm.create_chat_completion(
+                messages=turns,
+                response_format={"type": "json_object", "schema": DECISION_SCHEMA},
+                temperature=0.2,
+                max_tokens=5000,
+                stream=True,
+            )
+            try:
+                for chunk in stream:
+                    if cancel.is_set():  # client went away: stop burning CPU
+                        break
+                    piece = chunk["choices"][0]["delta"].get("content")
+                    if piece:
+                        raw.append(piece)
+                        emit(piece)
+            finally:
+                stream.close()
+    finally:
+        emit(None)
+    return "".join(raw)
+
+
+async def stream_reply(llm: Llama, turns: list[dict]):
+    loop = asyncio.get_running_loop()
+    cancel = threading.Event()
+    try:
+        for _ in range(MAX_TOOL_HOPS):
+            queue: asyncio.Queue = asyncio.Queue()
+            streamer = FinalAnswerStreamer()
+
+            def emit(piece):  # called from the worker thread
+                loop.call_soon_threadsafe(queue.put_nowait, piece)
+
+            task = loop.run_in_executor(None, generate_stream, llm, turns, emit, cancel)
+            while (piece := await queue.get()) is not None:
+                text = streamer.feed(piece)
+                if text:
+                    yield sse({"type": "token", "text": text})
+            raw = await task  # re-raises anything the worker hit
+
+            try:
+                decision = json.loads(raw)
+            except json.JSONDecodeError:
+                if not streamer.emitted:
+                    yield sse({"type": "token", "text": raw})
+                yield sse({"type": "done"})
+                return
+
+            if decision.get("action") == "tool_call" and decision.get("tool_name"):
+                name = decision["tool_name"]
+                args = decision.get("tool_arguments") or {}
+                yield sse({"type": "tool", "text": f"{name}({args})"})
+                result = await dispatch_tool(name, args)
+                turns.append({"role": "assistant", "content": raw})
+                turns.append(
+                    {
+                        "role": "user",
+                        "content": f"[Result of {name}]\n{result}\n\nContinue: answer the original question, "
+                        f"or call another tool if you still need to, in the same JSON shape.",
+                    }
+                )
+                continue
+
+            if not streamer.emitted:  # fallback if the answer never streamed
+                yield sse({"type": "token", "text": decision.get("final_answer", "")})
+            yield sse({"type": "done"})
+            return
+
+        yield sse({"type": "token", "text": "Reached the tool-call limit without a final answer — try rephrasing."})
+        yield sse({"type": "done"})
+    except Exception as exc:
+        yield sse({"type": "error", "text": str(exc)})
+    finally:
+        cancel.set()
+
+
+@app.post("/chat/stream", dependencies=[Depends(require_api_key)])
+async def chat_stream(req: ChatRequest):
+    llm = STATE.get("llm")
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model still loading.")
+
+    turns = build_turns(req.messages)
+    return StreamingResponse(
+        stream_reply(llm, turns),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
