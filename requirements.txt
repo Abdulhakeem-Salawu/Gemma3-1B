@@ -1,9 +1,12 @@
 fastapi
 uvicorn[standard]
 pydantic
+python-multipart
 llama-cpp-python
 mcp
 yfinance
 ddgs
 requests
 beautifulsoup4
+pypdf
+python-docx
