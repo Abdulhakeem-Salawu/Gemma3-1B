@@ -655,8 +655,10 @@ async def stream_reply(llm: Llama, turns: list[dict]):
             if decision.get("action") == "tool_call" and decision.get("tool_name"):
                 name = decision["tool_name"]
                 args = decision.get("tool_arguments") or {}
-                yield sse({"type": "tool", "text": f"{name}({args})"})
+                tool_call_id = uuid.uuid4().hex
+                yield sse({"type": "tool", "tool_call_id": tool_call_id, "name": name, "args": args})
                 result = await dispatch_tool(name, args)
+                yield sse({"type": "tool_result", "tool_call_id": tool_call_id, "result": result})
                 turns.append({"role": "assistant", "content": raw})
                 turns.append(
                     {

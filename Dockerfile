@@ -1,3 +1,15 @@
+# --- Frontend build stage -------------------------------------------------
+# React + assistant-ui chat UI, built to static assets and baked into the
+# final image below. Kept as its own stage so a Python-only dependency
+# change doesn't force a full npm reinstall, and vice versa.
+FROM node:22-slim AS web-build
+WORKDIR /web
+COPY web/package.json ./
+RUN npm install
+COPY web/ ./
+RUN npm run build
+
+# --- Application image -----------------------------------------------------
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -19,7 +31,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
-COPY static ./static
+COPY --from=web-build /web/dist ./static
 
 ENV PORT=8080
 EXPOSE 8080

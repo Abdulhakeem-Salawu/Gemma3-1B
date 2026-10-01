@@ -1,0 +1,109 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/*
+  Design tokens for gemma-agent.
+
+  Palette: warm ink/paper neutrals (not a pure #000/#fff, not the generic
+  AI-template cream-#F4F1EA) with a bronze-amber accent evolved from this
+  project's original amber (#ffb300) — deepened for better contrast and to
+  stay clearly distinct from Claude's own terracotta (#D97757).
+
+  Type: system UI sans stack for interface and prose; monospace reserved
+  for code only, unlike the previous all-monospace "terminal" look.
+*/
+@theme {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
+
+  --color-ink: #17160f;
+  --color-ink-soft: #2a281d;
+  --color-paper: #faf8f3;
+  --color-paper-soft: #f1ede2;
+
+  --color-accent: #b8721f;
+  --color-accent-hover: #a5620f;
+  --color-accent-soft: #f3e2c8;
+
+  --color-danger: #b3432f;
+}
+
+:root {
+  --bg: var(--color-paper);
+  --bg-soft: var(--color-paper-soft);
+  --fg: var(--color-ink);
+  --fg-muted: #6b6656;
+  --line: #e6e0d0;
+  --bubble-user: var(--color-paper-soft);
+  --accent: var(--color-accent);
+  --accent-hover: var(--color-accent-hover);
+  --accent-contrast: #fffaf0;
+  --danger: var(--color-danger);
+
+  color-scheme: light;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: var(--color-ink);
+    --bg-soft: var(--color-ink-soft);
+    --fg: var(--color-paper);
+    --fg-muted: #a39c86;
+    --line: #3a3729;
+    --bubble-user: var(--color-ink-soft);
+    --accent-contrast: #1a1200;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: var(--color-ink);
+  --bg-soft: var(--color-ink-soft);
+  --fg: var(--color-paper);
+  --fg-muted: #a39c86;
+  --line: #3a3729;
+  --bubble-user: var(--color-ink-soft);
+  --accent-contrast: #1a1200;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html {
+  scroll-padding-top: env(safe-area-inset-top, 0px);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--color-accent-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
