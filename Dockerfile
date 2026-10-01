@@ -1,20 +1,13 @@
-FROM python:3.11-slim
+# The slow llama-cpp-python compile lives in a prebuilt base image
+# (Dockerfile.base, built once with cloudbuild.base.yaml), so this build only
+# installs the light dependencies and copies the code (~1-2 min) every time.
+ARG BASE_IMAGE=us-central1-docker.pkg.dev/pioneering-axe-233302/cloud-run-source-deploy/gemma-agent-base:current
+FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Don't bake CPU-specific instructions into the build — the Cloud Build
-# machine's CPU may differ from the Cloud Run runtime's. Small portability
-# cost, avoids "illegal instruction" crashes at runtime.
-ENV CMAKE_ARGS="-DGGML_NATIVE=OFF"
-
-# Slow compile in its own layer so later dependency/code changes rebuild in
-# about a minute instead of ~15.
-RUN pip install --no-cache-dir llama-cpp-python
-
+# llama-cpp-python is already installed in the base image, so pip treats it as
+# satisfied and does not recompile it.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

@@ -1,0 +1,21 @@
+# Builds the llama-cpp-python BASE image. Run once (~12 min), and again only
+# to upgrade llama-cpp-python:
+#   gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
+#     --git-source-revision=main --region=us-central1 --config=cloudbuild.base.yaml
+# To upgrade, add:  --substitutions=_LLAMA_VERSION=0.3.37
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.base
+      - --build-arg
+      - LLAMA_CPP_PYTHON_VERSION=$_LLAMA_VERSION
+      - -t
+      - $_BASE_IMAGE
+      - .
+images: ['$_BASE_IMAGE']
+timeout: 1800s
+substitutions:
+  _LLAMA_VERSION: 0.3.36
+  _BASE_IMAGE: us-central1-docker.pkg.dev/pioneering-axe-233302/cloud-run-source-deploy/gemma-agent-base:current

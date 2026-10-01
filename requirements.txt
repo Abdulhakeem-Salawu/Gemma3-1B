@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 python-multipart
-llama-cpp-python
+llama-cpp-python==0.3.36  # keep in sync with Dockerfile.base
 mcp
 yfinance
 ddgs

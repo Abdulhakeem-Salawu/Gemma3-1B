@@ -1,0 +1,21 @@
+# Prebuilt BASE image: Python + build tools + a compiled llama-cpp-python.
+#
+# The llama.cpp compile takes ~12 minutes. It lives here, in its own image
+# that is built once (cloudbuild.base.yaml) and pulled by every app build, so a
+# normal build never recompiles it - even `gcloud builds submit --tag`, which
+# passes --no-cache to the Dockerfile's own layers (a FROM image is unaffected).
+#
+# Rebuild only to upgrade llama-cpp-python (see README).
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Don't bake CPU-specific instructions into the build - the Cloud Build
+# machine's CPU may differ from the Cloud Run runtime's. Small portability
+# cost, avoids "illegal instruction" crashes at runtime.
+ENV CMAKE_ARGS="-DGGML_NATIVE=OFF"
+
+ARG LLAMA_CPP_PYTHON_VERSION=0.3.36
+RUN pip install --no-cache-dir llama-cpp-python==${LLAMA_CPP_PYTHON_VERSION}

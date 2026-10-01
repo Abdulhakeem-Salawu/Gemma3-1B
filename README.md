@@ -12,8 +12,11 @@ chat UI, with tool calling and MCP server access, deployable to Cloud Run.
 - `eval/` — local-only tooling that judges logged chats with a local model and
   records scores in MLflow. See `eval/README.md` (it also covers the one-time
   Firestore setup this logging needs).
-- `Dockerfile` — container build. The model weights are **not** baked into
-  the image; they're mounted at runtime from a Cloud Storage bucket.
+- `Dockerfile` — app image, built `FROM` the prebuilt base image below. The
+  model weights are **not** baked into the image; they're mounted at runtime
+  from a Cloud Storage bucket.
+- `Dockerfile.base` + `cloudbuild.base.yaml` — the llama-cpp-python base image
+  (the slow ~12 min compile), built once and reused by every app build.
 - `requirements.txt` — Python dependencies.
 
 ## Deploy
@@ -21,13 +24,22 @@ chat UI, with tool calling and MCP server access, deployable to Cloud Run.
 1. Accept the license and download `gemma-3-1b-it-q4_0.gguf` from
    `google/gemma-3-1b-it-qat-q4_0-gguf` on Hugging Face.
 2. Upload it to your bucket: `gcloud storage cp gemma-3-1b-it-q4_0.gguf gs://YOUR_BUCKET/`
-3. Build straight from this repo (the llama.cpp compile takes ~15 min):
+3. **One time only:** build the llama-cpp-python base image (~12 min). Skip
+   this if `gemma-agent-base:current` already exists in your Artifact Registry.
+   ```
+   gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
+     --git-source-revision=main --region=us-central1 --config=cloudbuild.base.yaml
+   ```
+   Every build after that skips the compile. To upgrade llama-cpp-python, rerun
+   this with `--substitutions=_LLAMA_VERSION=<new version>` and bump the pin in
+   `requirements.txt`.
+4. Build the app (~1-2 min, even with `--tag`, which disables layer caching):
    ```
    gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
      --git-source-revision=main --region=us-central1 \
      --tag=us-central1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/gemma-agent
    ```
-4. Deploy (`--concurrency=1` matters: one llama.cpp instance isn't safe to
+5. Deploy (`--concurrency=1` matters: one llama.cpp instance isn't safe to
    share between simultaneous requests):
    ```
    gcloud run deploy gemma-agent \
