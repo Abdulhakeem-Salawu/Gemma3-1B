@@ -7,7 +7,11 @@ chat UI, with tool calling and MCP server access, deployable to Cloud Run.
 
 - `app.py` — FastAPI backend: loads the model, runs the tool-call loop,
   serves the chat UI.
+- `chatlog.py` — best-effort logging of every chat turn to Firestore (for eval).
 - `static/index.html` — the chat UI.
+- `eval/` — local-only tooling that judges logged chats with a local model and
+  records scores in MLflow. See `eval/README.md` (it also covers the one-time
+  Firestore setup this logging needs).
 - `Dockerfile` — container build. The model weights are **not** baked into
   the image; they're mounted at runtime from a Cloud Storage bucket.
 - `requirements.txt` — Python dependencies.

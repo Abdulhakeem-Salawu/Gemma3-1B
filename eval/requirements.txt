@@ -1,0 +1,5 @@
+# Install on your PC only (not in the Cloud Run image):
+#   pip install -r eval/requirements.txt
+mlflow
+google-cloud-firestore
+requests
