@@ -31,7 +31,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", "/mnt/models/gemma-3-1b-it-q4_0.gguf")
 APP_API_KEY = os.getenv("APP_API_KEY")  # set in production; unset = no auth (local dev only)
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 MCP_SERVER_URLS = [u.strip() for u in os.getenv("MCP_SERVER_URLS", "").split(",") if u.strip()]
-MAX_TOOL_HOPS = 4
+MAX_TOOL_HOPS = 15  # raised from 4 — a higher ceiling means a worse-case tool-looping request takes proportionally longer; watch it against timeoutSeconds (600s) and per-hop latency
 MAX_HISTORY_MESSAGES = 24  # crude guard against overflowing n_ctx
 N_CTX = int(os.getenv("N_CTX", "4096"))
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "4"))  # match the Cloud Run --cpu value
