@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir llama-cpp-python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY app.py chatlog.py ./
 COPY static ./static
 
 ENV PORT=8080

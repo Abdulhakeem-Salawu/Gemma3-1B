@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.gguf
+# local eval state (lives on your PC only)
+eval/mlflow.db
+eval/mlartifacts/
+eval/judged_ids.txt
