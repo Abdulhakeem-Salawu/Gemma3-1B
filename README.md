@@ -1,38 +1,58 @@
 # Gemma3-1B agent
 
-A small FastAPI service that runs Gemma 3 1B (via llama-cpp-python) behind a
-chat UI, with tool calling and MCP server access, deployable to Cloud Run.
+A small FastAPI service that runs a Qwen/Gemma GGUF model (via llama-cpp-python)
+behind a React chat UI (assistant-ui), with tool calling, document RAG, and MCP
+server access, deployable to Cloud Run.
 
 ## Layout
 
-- `app.py` — FastAPI backend: loads the model, runs the tool-call loop,
-  serves the chat UI.
-- `static/index.html` — the chat UI.
-- `Dockerfile` — container build. The model weights are **not** baked into
-  the image; they're mounted at runtime from a Cloud Storage bucket.
+- `app.py` — FastAPI backend: loads the model, runs the tool-call loop, serves
+  the chat UI.
+- `chatlog.py` — best-effort logging of every chat turn to Firestore (for eval).
+- `web/` — the React + assistant-ui chat frontend (built by the Dockerfile's
+  Node stage into `static/` — nothing under `web/dist` is committed).
+- `eval/` — local-only tooling that judges logged chats with a local model and
+  records scores in MLflow. See `eval/README.md` (it also covers the one-time
+  Firestore setup this logging needs).
+- `Dockerfile` — app image: builds the frontend, then builds `FROM` the
+  prebuilt base image below. The model weights are **not** baked into the
+  image; they're mounted at runtime from a Cloud Storage bucket.
+- `Dockerfile.base` + `cloudbuild.base.yaml` — the llama-cpp-python base image
+  (the slow ~12 min compile), built once and reused by every app build.
 - `requirements.txt` — Python dependencies.
 
 ## Deploy
 
-1. Accept the license and download `gemma-3-1b-it-q4_0.gguf` from
-   `google/gemma-3-1b-it-qat-q4_0-gguf` on Hugging Face.
-2. Upload it to your bucket: `gcloud storage cp gemma-3-1b-it-q4_0.gguf gs://YOUR_BUCKET/`
-3. Build straight from this repo (the llama.cpp compile takes ~15 min):
+1. Accept the license and download the GGUF model from Hugging Face.
+2. Upload it to your bucket: `gcloud storage cp model.gguf gs://YOUR_BUCKET/`
+3. **One time only:** build the llama-cpp-python base image (~12 min). Skip
+   this if `gemma-agent-base:current` already exists in your Artifact Registry.
+   ```
+   gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
+     --git-source-revision=main --region=us-central1 --config=cloudbuild.base.yaml
+   ```
+   Every build after that skips the compile. To upgrade llama-cpp-python, rerun
+   this with `--substitutions=_LLAMA_VERSION=<new version>` and bump the pin in
+   `requirements.txt`.
+4. Build the app (~1-3 min, even with `--tag`, which disables layer caching —
+   the base image is unaffected either way):
    ```
    gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
      --git-source-revision=main --region=us-central1 \
      --tag=us-central1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/gemma-agent
    ```
-4. Deploy (`--concurrency=1` matters: one llama.cpp instance isn't safe to
-   share between simultaneous requests):
+5. Deploy (`--concurrency=1` matters: one llama.cpp instance isn't safe to
+   share between simultaneous requests — without it, a second request can
+   silently queue behind the first for minutes with no Cloud Run-level
+   timeout handling):
    ```
    gcloud run deploy gemma-agent \
      --image us-central1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/gemma-agent \
      --region us-central1 --execution-environment gen2 \
-     --cpu 4 --memory 4Gi --cpu-boost --concurrency 1 --timeout 600 \
+     --cpu 4 --memory 6Gi --cpu-boost --concurrency 1 --timeout 600 \
      --add-volume name=models,type=cloud-storage,bucket=YOUR_BUCKET,readonly=true \
      --add-volume-mount volume=models,mount-path=/mnt/models \
-     --set-env-vars MODEL_PATH=/mnt/models/gemma-3-1b-it-q4_0.gguf,APP_API_KEY=pick-a-secret \
+     --set-env-vars MODEL_PATH=/mnt/models/your-model.gguf,APP_API_KEY=pick-a-secret \
      --allow-unauthenticated
    ```
 
@@ -42,3 +62,13 @@ it a tool that can change infrastructure.
 
 Add business-intelligence tools by adding a function + JSON-schema entry to
 `BUILTIN_TOOLS` in `app.py` — nothing else needs to change.
+
+## Frontend development
+
+```
+cd web
+npm install
+npm run dev      # local dev server, proxies nowhere — point it at a deployed
+                 # backend URL or run app.py locally too
+npm run build    # production build — this is what the Dockerfile runs
+```

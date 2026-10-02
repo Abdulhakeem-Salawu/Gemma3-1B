@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import threading
+import time
 import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -27,6 +28,8 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from pydantic import BaseModel
 
+import chatlog
+
 MODEL_PATH = os.getenv("MODEL_PATH", "/mnt/models/gemma-3-1b-it-q4_0.gguf")
 APP_API_KEY = os.getenv("APP_API_KEY")  # set in production; unset = no auth (local dev only)
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
@@ -35,13 +38,14 @@ MAX_TOOL_HOPS = 15  # raised from 4 — a higher ceiling means a worse-case tool
 MAX_HISTORY_MESSAGES = 24  # crude guard against overflowing n_ctx
 N_CTX = int(os.getenv("N_CTX", "4096"))
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "4"))  # match the Cloud Run --cpu value
+MAX_GENERATION_TOKENS = 1024  # was 5000 — each hop's generation is bounded by this; instructions already ask for short answers and one-sentence thinking, so 1024 covers normal replies with headroom while capping a worst-case rambling hop to a fraction of its previous cost
 INFERENCE_LOCK = threading.Lock()  # one llama.cpp instance is not thread-safe
 
 STATE: dict[str, Any] = {}
 
 # ---------------------------------------------------------------------------
 # Tools. To add a business-intelligence function later, write a plain python
-# function plus a JSON-schema description here — nothing else in this file
+# function plus a JSON-schema entry here — nothing else in this file
 # needs to change.
 # ---------------------------------------------------------------------------
 
@@ -472,16 +476,20 @@ def normalize_history(messages: list[dict]) -> list[dict]:
     return clean
 
 
-def build_turns(messages: list[dict], session_id: str | None = None) -> list[dict]:
+def build_turns(messages: list[dict], session_id: str | None = None, log: dict | None = None) -> list[dict]:
     """Client history -> the turns sent to the model (instructions ride on the
     newest user message). Used by /chat and /chat/stream (now the same
-    handler — see chat_stream below)."""
+    handler — see chat_stream below). If `log` is given, the question and the
+    retrieved document context are recorded into it for eval."""
     history = normalize_history(messages[-MAX_HISTORY_MESSAGES:])
     if not history or history[-1]["role"] != "user":
         raise HTTPException(status_code=400, detail="Last message must have role 'user'.")
 
     question = history[-1]["content"]
     context = retrieve_context(session_id, question)
+    if log is not None:
+        log["question"] = question
+        log["context"] = context
     context_block = f"\nContext from documents uploaded this session:\n{context}\n" if context else ""
     turns = history[:-1]  # everything before the newest question, replayed as-is
     turns.append(
@@ -600,7 +608,7 @@ def generate_stream(llm: Llama, turns: list[dict], emit, cancel: threading.Event
                 messages=turns,
                 response_format={"type": "json_object", "schema": DECISION_SCHEMA},
                 temperature=0.2,
-                max_tokens=5000,
+                max_tokens=MAX_GENERATION_TOKENS,
                 stream=True,
             )
             try:
@@ -618,9 +626,11 @@ def generate_stream(llm: Llama, turns: list[dict], emit, cancel: threading.Event
     return "".join(raw)
 
 
-async def stream_reply(llm: Llama, turns: list[dict]):
+async def stream_reply(llm: Llama, turns: list[dict], log: dict):
     loop = asyncio.get_running_loop()
     cancel = threading.Event()
+    started = time.monotonic()
+    last_call_signature: tuple[str, str] | None = None  # (name, sorted-args-json) of the previous hop's tool call
     try:
         for _ in range(MAX_TOOL_HOPS):
             queue: asyncio.Queue = asyncio.Queue()
@@ -643,22 +653,45 @@ async def stream_reply(llm: Llama, turns: list[dict]):
                 if answer_text:
                     yield sse({"type": "token", "text": answer_text})
             raw = await task  # re-raises anything the worker hit
+            log["hops"] += 1
 
             try:
                 decision = json.loads(raw)
             except json.JSONDecodeError:
+                log["status"], log["final_answer"] = "malformed", raw
                 if not answer_streamer.emitted:
                     yield sse({"type": "token", "text": raw})
                 yield sse({"type": "done"})
                 return
+            log["thinking"] = decision.get("thinking") or ""
 
             if decision.get("action") == "tool_call" and decision.get("tool_name"):
                 name = decision["tool_name"]
                 args = decision.get("tool_arguments") or {}
+                # A small model can get stuck re-issuing the identical call
+                # instead of using its result — with MAX_TOOL_HOPS raised to
+                # 15, that would otherwise burn every remaining hop (and its
+                # full generation latency) before the fallback below kicks
+                # in. Catch it after one repeat rather than fifteen.
+                signature = (name, json.dumps(args, sort_keys=True, default=str))
+                if signature == last_call_signature:
+                    log["status"] = "tool_loop"
+                    yield sse(
+                        {
+                            "type": "token",
+                            "text": f"That lookup ({name}) repeated without new information, so I stopped early "
+                            "rather than keep retrying — try rephrasing the question.",
+                        }
+                    )
+                    yield sse({"type": "done"})
+                    return
+                last_call_signature = signature
+
                 tool_call_id = uuid.uuid4().hex
                 yield sse({"type": "tool", "tool_call_id": tool_call_id, "name": name, "args": args})
                 result = await dispatch_tool(name, args)
                 yield sse({"type": "tool_result", "tool_call_id": tool_call_id, "result": result})
+                log["tool_calls"].append({"name": name, "args": args, "result": result})
                 turns.append({"role": "assistant", "content": raw})
                 turns.append(
                     {
@@ -669,17 +702,22 @@ async def stream_reply(llm: Llama, turns: list[dict]):
                 )
                 continue
 
+            log["status"], log["final_answer"] = "ok", decision.get("final_answer") or ""
             if not answer_streamer.emitted:  # fallback if the answer never streamed
                 yield sse({"type": "token", "text": decision.get("final_answer", "")})
             yield sse({"type": "done"})
             return
 
+        log["status"] = "tool_limit"
         yield sse({"type": "token", "text": "Reached the tool-call limit without a final answer — try rephrasing."})
         yield sse({"type": "done"})
     except Exception as exc:
+        log["status"], log["error"] = "error", str(exc)
         yield sse({"type": "error", "text": str(exc)})
     finally:
         cancel.set()
+        log["latency_s"] = round(time.monotonic() - started, 1)
+        await chatlog.persist(log)  # best-effort: never raises, never blocks a reply on failure
 
 
 # /chat now points at the same streaming handler as /chat/stream — there is
@@ -692,9 +730,10 @@ async def chat_stream(req: ChatRequest):
     if llm is None:
         raise HTTPException(status_code=503, detail="Model still loading.")
 
-    turns = build_turns(req.messages, req.session_id)
+    log = chatlog.new_log(MODEL_PATH, INSTANCE_ID, req.session_id)
+    turns = build_turns(req.messages, req.session_id, log)
     return StreamingResponse(
-        stream_reply(llm, turns),
+        stream_reply(llm, turns, log),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
