@@ -1,3 +1,7 @@
+# Declared before the first FROM so it's in global scope: an ARG used in a
+# later `FROM ${BASE_IMAGE}` must be, or Docker sees it as blank.
+ARG BASE_IMAGE=us-central1-docker.pkg.dev/pioneering-axe-233302/cloud-run-source-deploy/gemma-agent-base:current
+
 # --- Frontend build stage -------------------------------------------------
 # React + assistant-ui chat UI, built to static assets and baked into the
 # final image below. Kept as its own stage so a Python-only dependency
@@ -12,8 +16,7 @@ RUN npm run build
 # --- Application image -----------------------------------------------------
 # The slow llama-cpp-python compile lives in a prebuilt base image
 # (Dockerfile.base, built once with cloudbuild.base.yaml), so this build only
-# installs the light dependencies and copies the code (~1-2 min) every time.
-ARG BASE_IMAGE=us-central1-docker.pkg.dev/pioneering-axe-233302/cloud-run-source-deploy/gemma-agent-base:current
+# installs the light dependencies and copies the code (~1-3 min) every time.
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
