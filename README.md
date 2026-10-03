@@ -8,7 +8,8 @@ server access, deployable to Cloud Run.
 
 - `app.py` — FastAPI backend: loads the model, runs the tool-call loop, serves
   the chat UI.
-- `chatlog.py` — best-effort logging of every chat turn to Firestore (for eval).
+- `chatlog.py` — best-effort logging of every chat turn to Firestore (for eval),
+  written in a background task after the reply has finished streaming.
 - `web/` — the React + assistant-ui chat frontend (built by the Dockerfile's
   Node stage into `static/` — nothing under `web/dist` is committed).
 - `eval/` — local-only tooling that judges logged chats with a local model and
@@ -27,29 +28,34 @@ server access, deployable to Cloud Run.
 2. Upload it to your bucket: `gcloud storage cp model.gguf gs://YOUR_BUCKET/`
 3. **One time only:** build the llama-cpp-python base image (~12 min). Skip
    this if `gemma-agent-base:current` already exists in your Artifact Registry.
+   From a checkout of this repo:
    ```
-   gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
-     --git-source-revision=main --region=us-central1 --config=cloudbuild.base.yaml
+   gcloud builds submit . --region=us-central1 --config=cloudbuild.base.yaml
    ```
-   Every build after that skips the compile. To upgrade llama-cpp-python, rerun
-   this with `--substitutions=_LLAMA_VERSION=<new version>` and bump the pin in
-   `requirements.txt`.
-4. Build the app (~1-3 min, even with `--tag`, which disables layer caching —
-   the base image is unaffected either way):
+   (`--config` reads the file from your machine, so it won't work when pointed
+   at a git URL.) Every build after that skips the compile. To upgrade
+   llama-cpp-python, rerun with `--substitutions=_LLAMA_VERSION=<new version>`
+   and bump the pin in `requirements.txt`.
+4. Build the app (a few minutes, even with `--tag`, which disables layer
+   caching — the base image is unaffected either way):
    ```
    gcloud builds submit https://github.com/Abdulhakeem-Salawu/Gemma3-1B \
      --git-source-revision=main --region=us-central1 \
      --tag=us-central1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/gemma-agent
    ```
-5. Deploy (`--concurrency=1` matters: one llama.cpp instance isn't safe to
-   share between simultaneous requests — without it, a second request can
-   silently queue behind the first for minutes with no Cloud Run-level
-   timeout handling):
+5. Deploy. Two flags matter for latency and correctness:
+   - `--concurrency 1`: one llama.cpp instance isn't safe to share between
+     simultaneous requests — without it, a second request is accepted by the
+     container and silently queues behind a Python lock for minutes, with no
+     Cloud Run-level timeout handling.
+   - `--no-cpu-throttling`: chat logging runs in a background task *after* the
+     reply finishes; that needs CPU to stay allocated once the response ends.
    ```
    gcloud run deploy gemma-agent \
      --image us-central1-docker.pkg.dev/PROJECT/cloud-run-source-deploy/gemma-agent \
      --region us-central1 --execution-environment gen2 \
-     --cpu 4 --memory 6Gi --cpu-boost --concurrency 1 --timeout 600 \
+     --cpu 4 --memory 6Gi --cpu-boost --no-cpu-throttling \
+     --concurrency 1 --max-instances 1 --timeout 600 \
      --add-volume name=models,type=cloud-storage,bucket=YOUR_BUCKET,readonly=true \
      --add-volume-mount volume=models,mount-path=/mnt/models \
      --set-env-vars MODEL_PATH=/mnt/models/your-model.gguf,APP_API_KEY=pick-a-secret \
@@ -68,7 +74,7 @@ Add business-intelligence tools by adding a function + JSON-schema entry to
 ```
 cd web
 npm install
-npm run dev      # local dev server, proxies nowhere — point it at a deployed
-                 # backend URL or run app.py locally too
+npm run dev      # local dev server — point it at a deployed backend URL or
+                 # run app.py locally too
 npm run build    # production build — this is what the Dockerfile runs
 ```

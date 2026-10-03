@@ -108,9 +108,11 @@ def _write(doc: dict) -> None:
 
 
 async def persist(log: dict) -> None:
-    """Awaited from the request's own `finally`, so the write happens while
-    Cloud Run still counts the request as active (a fire-and-forget write
-    after the response can be CPU-throttled). Never raises."""
+    """Runs as a Starlette BackgroundTask: after the response stream has been
+    fully sent, so the write adds no reply latency. That is only safe because
+    the service runs with CPU always allocated (--no-cpu-throttling); with
+    request-based CPU, Cloud Run could throttle the instance before the write
+    finishes. Never raises."""
     if not LOG_ENABLED or not log.get("question"):
         return
     try:

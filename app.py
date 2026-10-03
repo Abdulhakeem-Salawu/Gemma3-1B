@@ -23,6 +23,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from llama_cpp import Llama
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -716,8 +717,11 @@ async def stream_reply(llm: Llama, turns: list[dict], log: dict):
         yield sse({"type": "error", "text": str(exc)})
     finally:
         cancel.set()
+        # Model-side latency only. The Firestore write is NOT awaited here: it
+        # runs as a background task after the stream has closed (see
+        # chat_stream), so it neither holds the reply open nor delays the next
+        # request under concurrency=1.
         log["latency_s"] = round(time.monotonic() - started, 1)
-        await chatlog.persist(log)  # best-effort: never raises, never blocks a reply on failure
 
 
 # /chat now points at the same streaming handler as /chat/stream — there is
@@ -736,6 +740,11 @@ async def chat_stream(req: ChatRequest):
         stream_reply(llm, turns, log),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        # Runs after the last byte is sent (also after a client disconnect), so
+        # logging adds no reply latency. Relies on the service running with CPU
+        # always allocated (--no-cpu-throttling), otherwise Cloud Run may
+        # throttle the instance before the write completes.
+        background=BackgroundTask(chatlog.persist, log),
     )
 
 
