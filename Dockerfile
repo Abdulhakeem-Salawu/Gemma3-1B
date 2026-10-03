@@ -1,20 +1,16 @@
-# The slow llama-cpp-python compile lives in a prebuilt base image
-# (Dockerfile.base, built once with cloudbuild.base.yaml), so this build only
-# installs the light dependencies and copies the code (~1-2 min) every time.
-ARG BASE_IMAGE=us-central1-docker.pkg.dev/pioneering-axe-233302/cloud-run-source-deploy/gemma-agent-base:current
-FROM ${BASE_IMAGE}
+# Prebuilt BASE image: Python + build tools + a compiled llama-cpp-python.
+# (Copy of Dockerfile.base placed at the repo root of this throwaway branch so
+# `gcloud builds submit --tag` can build it; see main's Dockerfile.base.)
+FROM python:3.11-slim
 
-WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# llama-cpp-python is already installed in the base image, so pip treats it as
-# satisfied and does not recompile it.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Don't bake CPU-specific instructions into the build - the Cloud Build
+# machine's CPU may differ from the Cloud Run runtime's. Small portability
+# cost, avoids "illegal instruction" crashes at runtime.
+ENV CMAKE_ARGS="-DGGML_NATIVE=OFF"
 
-COPY app.py chatlog.py ./
-COPY static ./static
-
-ENV PORT=8080
-EXPOSE 8080
-
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+ARG LLAMA_CPP_PYTHON_VERSION=0.3.36
+RUN pip install --no-cache-dir llama-cpp-python==${LLAMA_CPP_PYTHON_VERSION}
