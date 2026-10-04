@@ -40,6 +40,8 @@ MAX_HISTORY_MESSAGES = 24  # crude guard against overflowing n_ctx
 N_CTX = int(os.getenv("N_CTX", "4096"))
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "4"))  # match the Cloud Run --cpu value
 MAX_GENERATION_TOKENS = 1400  # was 5000, then 1024, then 2048. 1024 cut long answers off mid-JSON. Qwen3-4B on 4 vCPU generates only ~3 tokens/s in production (roughly 67s for ~200 tokens in chat_logs), so 2048 could not finish inside the 600s request timeout; 1400 (~470s of generation plus prompt processing) still leaves room for a 500+ word answer. Watch it against timeoutSeconds and N_CTX, which also has to hold the prompt and history
+MAX_HISTORY_TOKENS = int(os.getenv("MAX_HISTORY_TOKENS", "2500"))  # cap on replayed chat history; there is no KV-cache reuse across turns, so every history token is re-processed on every turn (slow on CPU)
+PROMPT_MARGIN_TOKENS = 64  # slack for chat-template tokens around each turn
 INFERENCE_LOCK = threading.Lock()  # one llama.cpp instance is not thread-safe
 
 STATE: dict[str, Any] = {}
@@ -405,12 +407,12 @@ Rules:
 - Use "tool_call" ONLY when the user asks for current prices, market data or recent news/facts that a tool can fetch.
 - If context from uploaded documents is given above and it answers the question, use it and say so. If it's there but doesn't cover the question, say it doesn't rather than guessing.
 - Never invent prices, dates or news. If it did not come from a tool result or the document context above, do not state it.
-- Match the depth of your answer to the question. For greetings and simple facts, one or two sentences. For anything that asks for an explanation, details, examples, a comparison, a how-to, advice, analysis or writing (this includes follow-ups like "tell me more", "explain in detail" or "give examples"), write a full, rich answer of roughly 250-500 words: open with a direct answer, then develop it by explaining the why, giving 2-4 concrete examples, and ending with a practical tip or takeaway. Never answer a request for detail in just a few sentences.
+- Match the depth of your answer to the question. For greetings and simple facts, one or two sentences. For anything that asks for an explanation, details, examples, a comparison, a how-to, advice, analysis or writing (this includes follow-ups like "tell me more", "explain in detail" or "give examples"), write a full, rich answer of at least 250 words (usually 300-500): open with a direct answer, then develop it by explaining the why, giving 2-4 concrete examples, and ending with a practical tip or takeaway. Never answer a request for detail in just a few sentences.
 - For follow-up questions, build on the conversation so far and add NEW detail and examples. Do not repeat your previous answer.
 - Inside "final_answer", put each list item on its own line and separate paragraphs with a blank line. Short **bold** headings are fine. This keeps long answers readable.
 
 Respond with ONLY a JSON object of this exact shape:
-{{"thinking": "<your brief reasoning>", "action": "tool_call" or "final_answer", "tool_name": "<name or empty string>", "tool_arguments": {{...or empty object}}, "final_answer": "<your reply to the user, or empty string if calling a tool>"}}
+{{"thinking": "<your brief reasoning>", "action": "tool_call" or "final_answer", "tool_name": "<name or empty string>", "tool_arguments": {{...or empty object}}, "final_answer": "<your full reply to the user: thorough, specific and well organized, with examples, for explanations, how-tos, comparisons, advice and writing; just a sentence or two for greetings and simple facts; empty string if calling a tool>"}}
 
 Leave the fields you don't need empty rather than omitting them.
 
@@ -465,18 +467,34 @@ class ChatRequest(BaseModel):
 
 def normalize_history(messages: list[dict]) -> list[dict]:
     """Gemma's chat template needs strict user/assistant alternation that
-    starts with 'user'. Merge repeated roles and drop anything else, so a
-    malformed client history can never turn into a 500."""
+    starts with 'user'. Merge repeated assistant messages, keep the newest of
+    repeated user messages, and drop anything else, so a malformed client
+    history can never turn into a 500."""
     clean: list[dict] = []
     for m in messages:
         role, content = m.get("role"), m.get("content")
         if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
             continue
         if clean and clean[-1]["role"] == role:
-            clean[-1]["content"] += "\n\n" + content
+            if role == "user":
+                # Two user messages in a row means the first never got a reply
+                # (its request failed). Keep only the newest: merging them made
+                # every retry re-send the failed text, which grew the prompt
+                # until every later turn in that chat overflowed n_ctx too.
+                clean[-1]["content"] = content
+            else:
+                clean[-1]["content"] += "\n\n" + content
         elif clean or role == "user":
             clean.append({"role": role, "content": content})
     return clean
+
+
+class PromptTooLong(Exception):
+    """The newest message alone (plus instructions) cannot fit in the context window."""
+
+
+def count_tokens(llm: Llama, text: str) -> int:
+    return len(llm.tokenize(text.encode("utf-8"), add_bos=False))
 
 
 def build_turns(messages: list[dict], session_id: str | None = None, log: dict | None = None) -> list[dict]:
@@ -494,16 +512,42 @@ def build_turns(messages: list[dict], session_id: str | None = None, log: dict |
         log["question"] = question
         log["context"] = context
     context_block = f"\nContext from documents uploaded this session:\n{context}\n" if context else ""
-    turns = history[:-1]  # everything before the newest question, replayed as-is
-    turns.append(
-        {
-            "role": "user",
-            "content": INSTRUCTIONS_TEMPLATE.format(
-                tools=tool_directory_text(), context_block=context_block, question=question
-            ),
-        }
-    )
-    return turns
+    final_turn = {
+        "role": "user",
+        "content": INSTRUCTIONS_TEMPLATE.format(
+            tools=tool_directory_text(), context_block=context_block, question=question
+        ),
+    }
+    older = history[:-1]  # everything before the newest question, replayed as-is
+
+    llm = STATE.get("llm")
+    if llm is not None:
+        # n_ctx has to hold the prompt AND the reply, so the prompt may only
+        # use what MAX_GENERATION_TOKENS leaves free. Drop the oldest turns
+        # until the history fits (it used to be capped by message count, which
+        # let a few long answers overflow the window: "Requested tokens (4288)
+        # exceed context window of 4096").
+        budget = N_CTX - MAX_GENERATION_TOKENS
+        used = count_tokens(llm, final_turn["content"]) + PROMPT_MARGIN_TOKENS
+        if used > budget:
+            raise PromptTooLong(
+                f"That message is too long for me to read in full (about {used} tokens; the limit per "
+                f"message is about {budget - 800}). Please shorten it or split it into parts."
+            )
+        history_budget = min(MAX_HISTORY_TOKENS, budget - used)
+        kept: list[dict] = []
+        spent = 0
+        for m in reversed(older):  # newest first, so recent context survives
+            cost = count_tokens(llm, m["content"]) + PROMPT_MARGIN_TOKENS
+            if spent + cost > history_budget:
+                break
+            kept.append(m)
+            spent += cost
+        older = kept[::-1]
+        while older and older[0]["role"] != "user":  # a window must still start on a user turn
+            older.pop(0)
+
+    return older + [final_turn]
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +781,21 @@ async def chat_stream(req: ChatRequest):
         raise HTTPException(status_code=503, detail="Model still loading.")
 
     log = chatlog.new_log(MODEL_PATH, INSTANCE_ID, req.session_id)
-    turns = build_turns(req.messages, req.session_id, log)
+    try:
+        turns = build_turns(req.messages, req.session_id, log)
+    except PromptTooLong as exc:
+        log["status"], log["error"] = "too_long", str(exc)
+
+        async def too_long():
+            yield sse({"type": "token", "text": str(exc)})
+            yield sse({"type": "done"})
+
+        return StreamingResponse(
+            too_long(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            background=BackgroundTask(chatlog.persist, log),
+        )
     return StreamingResponse(
         stream_reply(llm, turns, log),
         media_type="text/event-stream",
