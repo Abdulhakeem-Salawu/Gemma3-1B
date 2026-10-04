@@ -36,12 +36,16 @@ APP_API_KEY = os.getenv("APP_API_KEY")  # set in production; unset = no auth (lo
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 MCP_SERVER_URLS = [u.strip() for u in os.getenv("MCP_SERVER_URLS", "").split(",") if u.strip()]
 MAX_TOOL_HOPS = 15  # raised from 4 — a higher ceiling means a worse-case tool-looping request takes proportionally longer; watch it against timeoutSeconds (600s) and per-hop latency
-MAX_HISTORY_MESSAGES = 24  # crude guard against overflowing n_ctx
+MAX_HISTORY_MESSAGES = 40  # upper bound on messages considered; the token budget in build_turns is what actually protects n_ctx
 N_CTX = int(os.getenv("N_CTX", "4096"))
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "4"))  # match the Cloud Run --cpu value
 MAX_GENERATION_TOKENS = 1400  # was 5000, then 1024, then 2048. 1024 cut long answers off mid-JSON. Qwen3-4B on 4 vCPU generates only ~3 tokens/s in production (roughly 67s for ~200 tokens in chat_logs), so 2048 could not finish inside the 600s request timeout; 1400 (~470s of generation plus prompt processing) still leaves room for a 500+ word answer. Watch it against timeoutSeconds and N_CTX, which also has to hold the prompt and history
 MAX_HISTORY_TOKENS = int(os.getenv("MAX_HISTORY_TOKENS", "2500"))  # cap on replayed chat history; there is no KV-cache reuse across turns, so every history token is re-processed on every turn (slow on CPU)
-PROMPT_MARGIN_TOKENS = 64  # slack for chat-template tokens around each turn
+PROMPT_MARGIN_TOKENS = 64  # slack for the instructions turn and the start of the reply
+MESSAGE_OVERHEAD_TOKENS = 12  # chat-template tokens wrapped around each replayed message
+KEEP_USER_CHARS = 1200  # older user messages are replayed verbatim up to this length
+KEEP_ANSWER_CHARS = 300  # older assistant answers are reduced to their opening sentences, up to this length
+KEEP_ANSWER_SENTENCES = 2
 INFERENCE_LOCK = threading.Lock()  # one llama.cpp instance is not thread-safe
 
 STATE: dict[str, Any] = {}
@@ -497,6 +501,63 @@ def count_tokens(llm: Llama, text: str) -> int:
     return len(llm.tokenize(text.encode("utf-8"), add_bos=False))
 
 
+# A sentence ends at . ! or ? after a letter or closing quote/bracket, so list
+# numbers ("1.") and years do not count as sentence ends.
+_SENTENCE_END = re.compile(r"(?<=[A-Za-z)\"'\u2019\u201d][.!?])\s+")
+
+
+def shorten_message(m: dict) -> dict:
+    """Compact an older chat message. User messages are the questions, which
+    are short and carry the thread, so they are kept verbatim (only a very long
+    paste is cut). Assistant answers are long, so only their opening
+    sentences are kept, marked with an ellipsis so the model knows they were
+    abbreviated."""
+    text = m["content"]
+    if m["role"] == "user":
+        if len(text) <= KEEP_USER_CHARS:
+            return m
+        cut = text[:KEEP_USER_CHARS].rsplit(" ", 1)[0]
+        return {"role": "user", "content": cut + " [\u2026]"}
+    flat = " ".join(text.split())
+    short = " ".join(_SENTENCE_END.split(flat)[:KEEP_ANSWER_SENTENCES])
+    if len(short) > KEEP_ANSWER_CHARS:
+        short = short[:KEEP_ANSWER_CHARS].rsplit(" ", 1)[0]
+    if short == flat:
+        return {"role": "assistant", "content": flat}
+    return {"role": "assistant", "content": short + " [\u2026]"}
+
+
+def fit_history(llm: Llama, older: list[dict], budget: int) -> list[dict]:
+    """Make the replayed history fit `budget` tokens. If everything fits it is
+    sent untouched. Otherwise it is compacted: the most recent exchange stays
+    in full (follow-ups like "continue" or "tell me more" depend on it), every
+    older message goes through shorten_message, and if that is still too big
+    the oldest messages are dropped."""
+
+    def cost(m: dict) -> int:
+        return count_tokens(llm, m["content"]) + MESSAGE_OVERHEAD_TOKENS
+
+    if sum(cost(m) for m in older) <= budget:
+        return older
+    kept: list[dict] = []
+    spent = 0
+    for i in range(len(older) - 1, -1, -1):  # newest first, so recent context survives
+        m = older[i]
+        recent = i >= len(older) - 2
+        for option in ([m, shorten_message(m)] if recent else [shorten_message(m)]):
+            c = cost(option)
+            if spent + c <= budget:
+                kept.append(option)
+                spent += c
+                break
+        else:
+            break  # nothing older fits either
+    kept.reverse()
+    while kept and kept[0]["role"] != "user":  # a window must still start on a user turn
+        kept.pop(0)
+    return kept
+
+
 def build_turns(messages: list[dict], session_id: str | None = None, log: dict | None = None) -> list[dict]:
     """Client history -> the turns sent to the model (instructions ride on the
     newest user message). Used by /chat and /chat/stream (now the same
@@ -523,10 +584,10 @@ def build_turns(messages: list[dict], session_id: str | None = None, log: dict |
     llm = STATE.get("llm")
     if llm is not None:
         # n_ctx has to hold the prompt AND the reply, so the prompt may only
-        # use what MAX_GENERATION_TOKENS leaves free. Drop the oldest turns
-        # until the history fits (it used to be capped by message count, which
-        # let a few long answers overflow the window: "Requested tokens (4288)
-        # exceed context window of 4096").
+        # use what MAX_GENERATION_TOKENS leaves free. Compact, then drop, the
+        # oldest turns until the history fits (it used to be capped by message
+        # count, which let a few long answers overflow the window: "Requested
+        # tokens (4288) exceed context window of 4096").
         budget = N_CTX - MAX_GENERATION_TOKENS
         used = count_tokens(llm, final_turn["content"]) + PROMPT_MARGIN_TOKENS
         if used > budget:
@@ -534,18 +595,7 @@ def build_turns(messages: list[dict], session_id: str | None = None, log: dict |
                 f"That message is too long for me to read in full (about {used} tokens; the limit per "
                 f"message is about {budget - 800}). Please shorten it or split it into parts."
             )
-        history_budget = min(MAX_HISTORY_TOKENS, budget - used)
-        kept: list[dict] = []
-        spent = 0
-        for m in reversed(older):  # newest first, so recent context survives
-            cost = count_tokens(llm, m["content"]) + PROMPT_MARGIN_TOKENS
-            if spent + cost > history_budget:
-                break
-            kept.append(m)
-            spent += cost
-        older = kept[::-1]
-        while older and older[0]["role"] != "user":  # a window must still start on a user turn
-            older.pop(0)
+        older = fit_history(llm, older, min(MAX_HISTORY_TOKENS, budget - used))
 
     return older + [final_turn]
 
