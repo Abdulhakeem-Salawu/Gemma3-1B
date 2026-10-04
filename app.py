@@ -39,7 +39,7 @@ MAX_TOOL_HOPS = 15  # raised from 4 — a higher ceiling means a worse-case tool
 MAX_HISTORY_MESSAGES = 24  # crude guard against overflowing n_ctx
 N_CTX = int(os.getenv("N_CTX", "4096"))
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "4"))  # match the Cloud Run --cpu value
-MAX_GENERATION_TOKENS = 1024  # was 5000 — each hop's generation is bounded by this; instructions already ask for short answers and one-sentence thinking, so 1024 covers normal replies with headroom while capping a worst-case rambling hop to a fraction of its previous cost
+MAX_GENERATION_TOKENS = 2048  # was 5000, then 1024. Each hop's generation is bounded by this. 1024 was too tight: a long, detailed answer hit the cap mid-JSON and got cut off, so 2048 leaves room for thorough replies while still capping a worst-case rambling hop (watch it against timeoutSeconds and N_CTX, which also has to hold the prompt and history)
 INFERENCE_LOCK = threading.Lock()  # one llama.cpp instance is not thread-safe
 
 STATE: dict[str, Any] = {}
@@ -394,7 +394,7 @@ DECISION_SCHEMA = {
     "required": ["thinking", "action", "tool_name", "tool_arguments", "final_answer"],
 }
 
-INSTRUCTIONS_TEMPLATE = """You are a concise, friendly assistant. Answer normally from your own knowledge.
+INSTRUCTIONS_TEMPLATE = """You are a friendly, knowledgeable assistant. Answer normally from your own knowledge.
 
 You also have these tools:
 {tools}
@@ -405,7 +405,7 @@ Rules:
 - Use "tool_call" ONLY when the user asks for current prices, market data or recent news/facts that a tool can fetch.
 - If context from uploaded documents is given above and it answers the question, use it and say so. If it's there but doesn't cover the question, say it doesn't rather than guessing.
 - Never invent prices, dates or news. If it did not come from a tool result or the document context above, do not state it.
-- Keep answers short.
+- Match the length of your answer to the question: a sentence or two for greetings and simple facts, but for explanations, comparisons, how-tos, analysis or writing tasks give a thorough, well-structured answer with the detail the user needs (short paragraphs or lists are fine). Do not summarize when the user asked for detail.
 
 Respond with ONLY a JSON object of this exact shape:
 {{"thinking": "<your brief reasoning>", "action": "tool_call" or "final_answer", "tool_name": "<name or empty string>", "tool_arguments": {{...or empty object}}, "final_answer": "<your reply to the user, or empty string if calling a tool>"}}
