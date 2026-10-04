@@ -39,7 +39,7 @@ MAX_TOOL_HOPS = 15  # raised from 4 — a higher ceiling means a worse-case tool
 MAX_HISTORY_MESSAGES = 24  # crude guard against overflowing n_ctx
 N_CTX = int(os.getenv("N_CTX", "4096"))
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "4"))  # match the Cloud Run --cpu value
-MAX_GENERATION_TOKENS = 2048  # was 5000, then 1024. Each hop's generation is bounded by this. 1024 was too tight: a long, detailed answer hit the cap mid-JSON and got cut off, so 2048 leaves room for thorough replies while still capping a worst-case rambling hop (watch it against timeoutSeconds and N_CTX, which also has to hold the prompt and history)
+MAX_GENERATION_TOKENS = 1400  # was 5000, then 1024, then 2048. 1024 cut long answers off mid-JSON. Qwen3-4B on 4 vCPU generates only ~3 tokens/s in production (roughly 67s for ~200 tokens in chat_logs), so 2048 could not finish inside the 600s request timeout; 1400 (~470s of generation plus prompt processing) still leaves room for a 500+ word answer. Watch it against timeoutSeconds and N_CTX, which also has to hold the prompt and history
 INFERENCE_LOCK = threading.Lock()  # one llama.cpp instance is not thread-safe
 
 STATE: dict[str, Any] = {}
@@ -394,18 +394,20 @@ DECISION_SCHEMA = {
     "required": ["thinking", "action", "tool_name", "tool_arguments", "final_answer"],
 }
 
-INSTRUCTIONS_TEMPLATE = """You are a friendly, knowledgeable assistant. Answer normally from your own knowledge.
+INSTRUCTIONS_TEMPLATE = """You are a friendly, knowledgeable assistant who explains things clearly and in depth, like a good teacher. Answer normally from your own knowledge.
 
 You also have these tools:
 {tools}
 {context_block}
 Rules:
-- First, fill "thinking" with ONE short sentence (max ~15 words) of your own reasoning about how to answer. The user can see this, so keep it brief.
+- First, fill "thinking" with ONE short sentence (max 15 words) of your own reasoning about how to answer. The user can see this, so never write more than that.
 - Greetings, general questions: answer directly with action "final_answer". Do not use a tool.
 - Use "tool_call" ONLY when the user asks for current prices, market data or recent news/facts that a tool can fetch.
 - If context from uploaded documents is given above and it answers the question, use it and say so. If it's there but doesn't cover the question, say it doesn't rather than guessing.
 - Never invent prices, dates or news. If it did not come from a tool result or the document context above, do not state it.
-- Match the length of your answer to the question: a sentence or two for greetings and simple facts, but for explanations, comparisons, how-tos, analysis or writing tasks give a thorough, well-structured answer with the detail the user needs (short paragraphs or lists are fine). Do not summarize when the user asked for detail.
+- Match the depth of your answer to the question. For greetings and simple facts, one or two sentences. For anything that asks for an explanation, details, examples, a comparison, a how-to, advice, analysis or writing (this includes follow-ups like "tell me more", "explain in detail" or "give examples"), write a full, rich answer of roughly 250-500 words: open with a direct answer, then develop it by explaining the why, giving 2-4 concrete examples, and ending with a practical tip or takeaway. Never answer a request for detail in just a few sentences.
+- For follow-up questions, build on the conversation so far and add NEW detail and examples. Do not repeat your previous answer.
+- Inside "final_answer", write line breaks as \\n: use \\n\\n between paragraphs, and start list items with "\\n- " or "\\n1. ". Short **bold** headings are fine. This keeps long answers readable.
 
 Respond with ONLY a JSON object of this exact shape:
 {{"thinking": "<your brief reasoning>", "action": "tool_call" or "final_answer", "tool_name": "<name or empty string>", "tool_arguments": {{...or empty object}}, "final_answer": "<your reply to the user, or empty string if calling a tool>"}}
@@ -608,7 +610,7 @@ def generate_stream(llm: Llama, turns: list[dict], emit, cancel: threading.Event
             stream = llm.create_chat_completion(
                 messages=turns,
                 response_format={"type": "json_object", "schema": DECISION_SCHEMA},
-                temperature=0.2,
+                temperature=0.6,
                 max_tokens=MAX_GENERATION_TOKENS,
                 stream=True,
             )
