@@ -29,6 +29,12 @@
   --color-accent-soft: #f3e2c8;
 
   --color-danger: #b3432f;
+
+  --animate-fade-in: fade-in 0.35s ease-out;
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
 }
 
 :root {

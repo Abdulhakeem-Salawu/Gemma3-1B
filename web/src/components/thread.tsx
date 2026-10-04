@@ -6,6 +6,7 @@ import {
 import { useMessageError } from "@assistant-ui/core/react";
 import { ArrowDownIcon, CheckIcon, CopyIcon, Sparkles } from "lucide-react";
 import { AssistantText, Reasoning, ToolFallback } from "./message-parts";
+import { PendingIndicator } from "./pending-indicator";
 import { cn } from "@/lib/utils";
 
 function UserMessage() {
@@ -31,6 +32,7 @@ function AssistantMessage() {
           <Sparkles className="size-3.5" />
         </div>
         <div className="min-w-0 flex-1 text-[15px]">
+          <PendingIndicator />
           <MessagePrimitive.Parts
             components={{
               Text: AssistantText,
