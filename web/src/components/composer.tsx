@@ -1,17 +1,23 @@
 import { ComposerPrimitive, ThreadPrimitive } from "@assistant-ui/react";
 import { ArrowUpIcon, SquareIcon } from "lucide-react";
+import { useCompactionView } from "@/lib/compaction";
+import { CompactionBanner } from "./compaction-banner";
 import { DocumentsBar } from "./documents-bar";
 
 export function Composer() {
+  // No new question is accepted while older messages are being condensed.
+  const busy = useCompactionView().phase !== "idle";
   return (
     <div className="border-t border-[var(--line)] bg-[var(--bg)] pb-[env(safe-area-inset-bottom,0px)]">
+      <CompactionBanner />
       <DocumentsBar />
       <ComposerPrimitive.Root className="mx-auto flex w-full max-w-[720px] items-end gap-2 px-4 py-3">
         <ComposerPrimitive.Input
           rows={1}
           autoFocus
-          placeholder="Ask something…"
-          className="max-h-40 flex-1 resize-none rounded-2xl border border-[var(--line)] bg-[var(--bg-soft)] px-4 py-2.5 text-[15px] leading-relaxed text-[var(--fg)] placeholder:text-[var(--fg-muted)] focus:border-[var(--accent)] focus:outline-none"
+          disabled={busy}
+          placeholder={busy ? "Condensing the conversation…" : "Ask something…"}
+          className="max-h-40 flex-1 resize-none rounded-2xl border border-[var(--line)] bg-[var(--bg-soft)] px-4 py-2.5 text-[15px] leading-relaxed text-[var(--fg)] placeholder:text-[var(--fg-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-60"
         />
         <ThreadPrimitive.If running={false}>
           <ComposerPrimitive.Send

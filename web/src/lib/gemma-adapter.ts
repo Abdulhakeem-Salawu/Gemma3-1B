@@ -3,9 +3,9 @@ import type {
   ReasoningMessagePart,
   TextMessagePart,
   ThreadAssistantMessagePart,
-  ThreadMessage,
   ToolCallMessagePart,
 } from "@assistant-ui/react";
+import { compactConversation, summaryPayload, toHistory, type ContextInfo } from "./compaction";
 import { getApiKey, getSessionId } from "./session";
 
 /**
@@ -19,15 +19,8 @@ type GemmaEvent =
   | { type: "tool"; tool_call_id: string; name: string; args: unknown }
   | { type: "tool_result"; tool_call_id: string; result: string }
   | { type: "token"; text: string }
-  | { type: "done" }
+  | { type: "done"; context?: ContextInfo }
   | { type: "error"; text: string };
-
-function extractText(message: ThreadMessage): string {
-  return message.content
-    .filter((p): p is TextMessagePart => p.type === "text")
-    .map((p) => p.text)
-    .join("\n\n");
-}
 
 async function* parseSseFrames(
   body: ReadableStream<Uint8Array>,
@@ -55,15 +48,14 @@ async function* parseSseFrames(
 
 export const gemmaChatAdapter: ChatModelAdapter = {
   async *run({ messages, abortSignal }) {
-    const history = messages
-      .filter((m) => m.role === "user" || m.role === "assistant")
-      .map((m) => ({ role: m.role as "user" | "assistant", content: extractText(m) }))
-      .filter((m) => m.content.trim().length > 0);
+    const history = toHistory(messages);
 
+    // After a compaction the server gets the summary plus the full raw list;
+    // `summary_covers` says how many leading messages the summary replaces.
     const res = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": getApiKey() },
-      body: JSON.stringify({ messages: history, session_id: getSessionId() }),
+      body: JSON.stringify({ messages: history, session_id: getSessionId(), ...summaryPayload(history) }),
       signal: abortSignal,
     });
 
@@ -128,9 +120,24 @@ export const gemmaChatAdapter: ChatModelAdapter = {
         }
         case "error":
           throw new Error(evt.text);
-        case "done":
+        case "done": {
           yield { content: [...parts] };
+          // The context is nearly full: condense the older messages NOW, while
+          // the thread still counts as running, so the composer stays locked
+          // until the summary is stored. Never throws; on failure the user
+          // picks Retry or Continue anyway.
+          if (evt.context?.needs_compaction) {
+            const answer = toHistory([{ role: "assistant", content: parts }]);
+            await compactConversation({
+              history: [...history, ...answer],
+              threadMessages: messages,
+              apiKey: getApiKey(),
+              sessionId: getSessionId(),
+              signal: abortSignal,
+            });
+          }
           return;
+        }
       }
       yield { content: [...parts] };
     }

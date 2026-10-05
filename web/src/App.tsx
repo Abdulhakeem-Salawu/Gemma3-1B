@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { Composer } from "@/components/composer";
 import { clearStoredDocs } from "@/components/documents-bar";
 import { Thread } from "@/components/thread";
+import { reconcileSummary, resetCompaction, toHistory } from "@/lib/compaction";
 import { gemmaChatAdapter } from "@/lib/gemma-adapter";
 import { checkServerRestarted, resetSessionId } from "@/lib/session";
 
@@ -12,11 +13,16 @@ const HISTORY_STORAGE = "agent_history_v2";
 const THEME_STORAGE = "agent_theme";
 
 function loadHistory(): ThreadMessageLike[] {
+  let messages: ThreadMessageLike[] = [];
   try {
-    return JSON.parse(localStorage.getItem(HISTORY_STORAGE) ?? "[]");
+    messages = JSON.parse(localStorage.getItem(HISTORY_STORAGE) ?? "[]");
   } catch {
-    return [];
+    messages = [];
   }
+  // A stored summary only makes sense next to the messages it was made from;
+  // if those were truncated or cleared, drop it.
+  reconcileSummary(toHistory(messages));
+  return messages;
 }
 
 function useTheme() {
@@ -135,6 +141,7 @@ export default function App() {
     }
     localStorage.removeItem(HISTORY_STORAGE);
     clearStoredDocs();
+    resetCompaction(); // forgets the summary and stops a compaction still in flight
     resetSessionId();
     setInitialMessages([]);
     setGeneration((g) => g + 1);
