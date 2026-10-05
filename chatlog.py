@@ -73,7 +73,7 @@ def new_log(model_path: str, instance_id: str, session_id: str | None) -> dict:
 
 def _build_doc(log: dict) -> dict:
     now = datetime.now(timezone.utc)
-    return {
+    doc = {
         "ts": now,
         "expire_at": now + timedelta(days=LOG_TTL_DAYS),
         "model": log["model"],
@@ -98,6 +98,12 @@ def _build_doc(log: dict) -> dict:
         "error": _truncate(log["error"], 500),
         "latency_s": log["latency_s"],
     }
+    # Optional numbers about the request (compaction sizes and timings, context
+    # usage). Only written when present, so existing records keep their shape.
+    extra = log.get("extra")
+    if extra:
+        doc["extra"] = {str(k): v for k, v in extra.items() if v is None or isinstance(v, (int, float, bool, str))}
+    return doc
 
 
 def _write(doc: dict) -> None:

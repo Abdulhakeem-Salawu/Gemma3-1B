@@ -51,7 +51,7 @@ ENV MODEL_PATH=/models/${MODEL_FILE}
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py chatlog.py ./
+COPY app.py chatlog.py compaction.py ./
 COPY --from=web-build /web/dist ./static
 
 ENV PORT=8080
