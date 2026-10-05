@@ -30,6 +30,7 @@ from mcp.client.sse import sse_client
 from pydantic import BaseModel
 
 import chatlog
+import compaction
 
 MODEL_PATH = os.getenv("MODEL_PATH", "/mnt/models/gemma-3-1b-it-q4_0.gguf")
 APP_API_KEY = os.getenv("APP_API_KEY")  # set in production; unset = no auth (local dev only)
@@ -47,6 +48,23 @@ KEEP_USER_CHARS = 1200  # older user messages are replayed verbatim up to this l
 KEEP_ANSWER_CHARS = 300  # older assistant answers are reduced to their opening sentences, up to this length
 KEEP_ANSWER_SENTENCES = 2
 INFERENCE_LOCK = threading.Lock()  # one llama.cpp instance is not thread-safe
+
+# --- Summarization-based compaction (see compaction.py) --------------------
+# The client owns the summary and sends it with every chat request; the server
+# stays stateless. fit_history above remains the safety net: if no summary is
+# sent or compaction fails, chats behave exactly as they did before.
+COMPACT_AT_FRACTION = float(os.getenv("COMPACT_AT_FRACTION", "0.75"))  # compact when history reaches this share of its budget
+# Two exchanges stay verbatim. With n_ctx 4096 the budget is too tight for four
+# messages next to a summary, so the default drops to two there.
+KEEP_RECENT_MESSAGES = int(os.getenv("KEEP_RECENT_MESSAGES", "4" if N_CTX >= 6144 else "2"))
+SUMMARY_MAX_TOKENS = int(os.getenv("SUMMARY_MAX_TOKENS", "320"))  # generation cap for one summary
+SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "2500"))  # validation cap on a summary (sent or generated)
+# Per-call input cap for a compaction; it also has to leave room in n_ctx for the summary being written.
+COMPACT_INPUT_MAX_TOKENS = min(
+    int(os.getenv("COMPACT_INPUT_MAX_TOKENS", "3000")), N_CTX - SUMMARY_MAX_TOKENS - 128
+)
+COMPACT_PROGRESS_SECONDS = 10  # max silence on the /chat/compact stream (also keeps idle-connection timeouts away)
+COMPACT_PROGRESS_TOKENS = 8  # a progress event every this many generated tokens
 
 STATE: dict[str, Any] = {}
 
@@ -414,13 +432,13 @@ Rules:
 - Match the depth of your answer to the question. For greetings and simple facts, one or two sentences. For anything that asks for an explanation, details, examples, a comparison, a how-to, advice, analysis or writing (this includes follow-ups like "tell me more", "explain in detail" or "give examples"), write a full, rich answer of at least 250 words (usually 300-500): open with a direct answer, then develop it by explaining the why, giving 2-4 concrete examples, and ending with a practical tip or takeaway. Never answer a request for detail in just a few sentences.
 - For follow-up questions, build on the conversation so far and add NEW detail and examples. Do not repeat your previous answer.
 - Inside "final_answer", put each list item on its own line and separate paragraphs with a blank line. Short **bold** headings are fine. This keeps long answers readable.
-
+{summary_rule}
 Respond with ONLY a JSON object of this exact shape:
 {{"thinking": "<your brief reasoning>", "action": "tool_call" or "final_answer", "tool_name": "<name or empty string>", "tool_arguments": {{...or empty object}}, "final_answer": "<your full reply to the user: thorough, specific and well organized, with examples, for explanations, how-tos, comparisons, advice and writing; just a sentence or two for greetings and simple facts; empty string if calling a tool>"}}
 
 Leave the fields you don't need empty rather than omitting them.
 
-User: {question}"""
+{summary_block}User: {question}"""
 
 
 @asynccontextmanager
@@ -445,6 +463,23 @@ async def lifespan(app: FastAPI):
             print(f"[startup] could not load tools from {url}: {exc}")
     STATE["mcp_tools"] = mcp_tools
 
+    try:  # numbers needed to tune compaction; never allowed to block startup
+        instruction_tokens = count_tokens(
+            STATE["llm"],
+            INSTRUCTIONS_TEMPLATE.format(
+                tools=tool_directory_text(), context_block="", summary_rule="", summary_block="", question=""
+            ),
+        )
+        history_budget = min(MAX_HISTORY_TOKENS, N_CTX - MAX_GENERATION_TOKENS - instruction_tokens - PROMPT_MARGIN_TOKENS)
+        print(
+            f"[startup] compaction: instruction_tokens={instruction_tokens} n_ctx={N_CTX} "
+            f"history_budget={history_budget} compact_at={COMPACT_AT_FRACTION} keep_recent={KEEP_RECENT_MESSAGES} "
+            f"summary_max_tokens={SUMMARY_MAX_TOKENS} input_cap={COMPACT_INPUT_MAX_TOKENS}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[startup] could not measure instruction tokens: {exc!r}", flush=True)
+
     yield
     STATE.clear()
 
@@ -467,6 +502,10 @@ def require_api_key(x_api_key: str | None = Header(default=None)):
 class ChatRequest(BaseModel):
     messages: list[dict]  # [{"role": "user"|"assistant", "content": "..."}] — client keeps history
     session_id: str | None = None  # ties this chat to its uploaded documents, if any
+    # Compaction state, owned by the client (see compaction.py). A request with
+    # neither field behaves exactly as before.
+    summary: str | None = None  # model-written summary of the first `summary_covers` messages
+    summary_covers: int = 0  # how many leading messages of `messages` the summary already covers
 
 
 def normalize_history(messages: list[dict]) -> list[dict]:
@@ -558,11 +597,27 @@ def fit_history(llm: Llama, older: list[dict], budget: int) -> list[dict]:
     return kept
 
 
-def build_turns(messages: list[dict], session_id: str | None = None, log: dict | None = None) -> list[dict]:
+def build_turns(
+    messages: list[dict],
+    session_id: str | None = None,
+    log: dict | None = None,
+    summary: str | None = None,
+    summary_covers: int = 0,
+    usage: dict | None = None,
+) -> list[dict]:
     """Client history -> the turns sent to the model (instructions ride on the
     newest user message). Used by /chat and /chat/stream (now the same
     handler — see chat_stream below). If `log` is given, the question and the
-    retrieved document context are recorded into it for eval."""
+    retrieved document context are recorded into it for eval.
+
+    `summary`/`summary_covers` are the client's compaction state, already
+    validated by the caller: the first `summary_covers` RAW messages are
+    replaced by the summary. If `usage` is given it is filled with what
+    chat_stream needs to report context usage in the `done` event."""
+    if summary:
+        # Slice the RAW list first (before normalize_history merges or drops
+        # anything), so the client's indices stay valid.
+        messages = compaction.slice_after_summary(messages, summary_covers)
     history = normalize_history(messages[-MAX_HISTORY_MESSAGES:])
     if not history or history[-1]["role"] != "user":
         raise HTTPException(status_code=400, detail="Last message must have role 'user'.")
@@ -576,7 +631,11 @@ def build_turns(messages: list[dict], session_id: str | None = None, log: dict |
     final_turn = {
         "role": "user",
         "content": INSTRUCTIONS_TEMPLATE.format(
-            tools=tool_directory_text(), context_block=context_block, question=question
+            tools=tool_directory_text(),
+            context_block=context_block,
+            summary_rule=compaction.SUMMARY_RULE if summary else "",
+            summary_block=compaction.format_summary_block(summary) if summary else "",
+            question=question,
         ),
     }
     older = history[:-1]  # everything before the newest question, replayed as-is
@@ -587,7 +646,8 @@ def build_turns(messages: list[dict], session_id: str | None = None, log: dict |
         # use what MAX_GENERATION_TOKENS leaves free. Compact, then drop, the
         # oldest turns until the history fits (it used to be capped by message
         # count, which let a few long answers overflow the window: "Requested
-        # tokens (4288) exceed context window of 4096").
+        # tokens (4288) exceed context window of 4096"). A summary, when there
+        # is one, sits inside final_turn, so it is counted here too.
         budget = N_CTX - MAX_GENERATION_TOKENS
         used = count_tokens(llm, final_turn["content"]) + PROMPT_MARGIN_TOKENS
         if used > budget:
@@ -595,9 +655,39 @@ def build_turns(messages: list[dict], session_id: str | None = None, log: dict |
                 f"That message is too long for me to read in full (about {used} tokens; the limit per "
                 f"message is about {budget - 800}). Please shorten it or split it into parts."
             )
+        if usage is not None:
+            _fill_usage(llm, usage, final_turn["content"], older, question, context_block, summary)
         older = fit_history(llm, older, min(MAX_HISTORY_TOKENS, budget - used))
 
     return older + [final_turn]
+
+
+def _fill_usage(
+    llm: Llama,
+    usage: dict,
+    final_content: str,
+    older: list[dict],
+    question: str,
+    context_block: str,
+    summary: str | None,
+) -> None:
+    """What the `done` event needs: the instruction turn's size without the
+    summary, the summary's own size, and the not-yet-summarized history at FULL
+    length (before fit_history shortens anything), including the question."""
+    if summary:
+        plain = INSTRUCTIONS_TEMPLATE.format(
+            tools=tool_directory_text(), context_block=context_block, summary_rule="", summary_block="", question=question
+        )
+        instruction_tokens = count_tokens(llm, plain)
+        summary_tokens = max(0, count_tokens(llm, final_content) - instruction_tokens)
+    else:
+        instruction_tokens = count_tokens(llm, final_content)
+        summary_tokens = 0
+    history_tokens = sum(count_tokens(llm, m["content"]) + MESSAGE_OVERHEAD_TOKENS for m in older)
+    history_tokens += count_tokens(llm, question) + MESSAGE_OVERHEAD_TOKENS  # the question is history next turn
+    usage.update(
+        instruction_tokens=instruction_tokens, summary_tokens=summary_tokens, history_tokens=history_tokens
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +813,7 @@ def generate_stream(llm: Llama, turns: list[dict], emit, cancel: threading.Event
     return "".join(raw)
 
 
-async def stream_reply(llm: Llama, turns: list[dict], log: dict):
+async def stream_reply(llm: Llama, turns: list[dict], log: dict, context_after=None):
     loop = asyncio.get_running_loop()
     cancel = threading.Event()
     started = time.monotonic()
@@ -802,7 +892,13 @@ async def stream_reply(llm: Llama, turns: list[dict], log: dict):
             log["status"], log["final_answer"] = "ok", decision.get("final_answer") or ""
             if not answer_streamer.emitted:  # fallback if the answer never streamed
                 yield sse({"type": "token", "text": decision.get("final_answer", "")})
-            yield sse({"type": "done"})
+            done_event: dict = {"type": "done"}
+            if context_after is not None:  # normal completion only; never allowed to break a reply
+                try:
+                    done_event["context"] = context_after(log["final_answer"])
+                except Exception as exc:
+                    print(f"[compaction] could not compute context usage: {exc!r}")
+            yield sse(done_event)
             return
 
         log["status"] = "tool_limit"
@@ -830,9 +926,17 @@ async def chat_stream(req: ChatRequest):
     if llm is None:
         raise HTTPException(status_code=503, detail="Model still loading.")
 
-    log = chatlog.new_log(MODEL_PATH, INSTANCE_ID, req.session_id)
     try:
-        turns = build_turns(req.messages, req.session_id, log)
+        summary, covers = compaction.resolve_summary(
+            req.summary, req.summary_covers, len(req.messages), SUMMARY_MAX_CHARS
+        )
+    except ValueError as exc:  # oversized or non-string summary: tell the client, never drop it silently
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    log = chatlog.new_log(MODEL_PATH, INSTANCE_ID, req.session_id)
+    usage: dict = {}
+    try:
+        turns = build_turns(req.messages, req.session_id, log, summary, covers, usage)
     except PromptTooLong as exc:
         log["status"], log["error"] = "too_long", str(exc)
 
@@ -846,14 +950,192 @@ async def chat_stream(req: ChatRequest):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             background=BackgroundTask(chatlog.persist, log),
         )
+    if summary:
+        log["extra"] = {"summary_covers": covers, "summary_tokens": usage.get("summary_tokens")}
     return StreamingResponse(
-        stream_reply(llm, turns, log),
+        stream_reply(llm, turns, log, make_context_after(llm, req.messages, covers, usage, log)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         # Runs after the last byte is sent (also after a client disconnect), so
         # logging adds no reply latency. Relies on the service running with CPU
         # always allocated (--no-cpu-throttling), otherwise Cloud Run may
         # throttle the instance before the write completes.
+        background=BackgroundTask(chatlog.persist, log),
+    )
+
+
+def make_context_after(llm: Llama, messages: list[dict], covers: int, usage: dict, log: dict):
+    """Returns the callback stream_reply uses to build the `context` object of
+    the `done` event once the answer text is known. `needs_compaction` is
+    decided with select_fold_range on the same list the client will send to
+    /chat/compact (its messages plus this answer), so the two always agree."""
+
+    def context_after(answer: str) -> dict | None:
+        if "history_tokens" not in usage:  # no model-side counts (llm missing): nothing to report
+            return None
+        answer_tokens = count_tokens(llm, answer) + MESSAGE_OVERHEAD_TOKENS
+        used, budget = compaction.context_usage(
+            summary_tokens=usage["summary_tokens"],
+            history_tokens=usage["history_tokens"],
+            answer_tokens=answer_tokens,
+            instruction_tokens=usage["instruction_tokens"],
+            n_ctx=N_CTX,
+            max_generation_tokens=MAX_GENERATION_TOKENS,
+            max_history_tokens=MAX_HISTORY_TOKENS,
+            margin_tokens=PROMPT_MARGIN_TOKENS,
+        )
+        start, end = compaction.select_fold_range(
+            messages + [{"role": "assistant", "content": answer}], covers, KEEP_RECENT_MESSAGES
+        )
+        flag = compaction.needs_compaction(used, budget, COMPACT_AT_FRACTION, end > start)
+        log.setdefault("extra", {}).update(context_used=used, context_budget=budget, needs_compaction=flag)
+        return {"used": used, "budget": budget, "needs_compaction": flag}
+
+    return context_after
+
+
+class CompactRequest(BaseModel):
+    messages: list[dict]  # the client's full raw list, ending with the answer just produced
+    summary: str | None = None  # previous summary, if any
+    summary_covers: int = 0
+    session_id: str | None = None
+
+
+def compact_generate_stream(llm: Llama, prompt: str, emit, cancel: threading.Event) -> tuple[str, str | None]:
+    """Worker thread: one grammar-constrained compaction call. Same pattern as
+    generate_stream; returns (raw text, finish_reason)."""
+    raw: list[str] = []
+    finish: str | None = None
+    try:
+        with INFERENCE_LOCK:
+            if cancel.is_set():  # client left while this was queued behind a running answer
+                return "", None
+            stream = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object", "schema": compaction.SUMMARY_SCHEMA},
+                temperature=0.2,  # fidelity over variety
+                max_tokens=SUMMARY_MAX_TOKENS,
+                stream=True,
+            )
+            try:
+                for chunk in stream:
+                    if cancel.is_set():  # client went away: stop burning CPU, release the lock
+                        break
+                    choice = chunk["choices"][0]
+                    piece = choice["delta"].get("content")
+                    if piece:
+                        raw.append(piece)
+                        emit(piece)
+                    if choice.get("finish_reason"):
+                        finish = choice["finish_reason"]
+            finally:
+                stream.close()
+    finally:
+        emit(None)
+    return "".join(raw), finish
+
+
+async def stream_compact(
+    llm: Llama, previous_summary: str | None, chunks: list[list[dict]], fold_count: int,
+    new_covers: int, input_tokens: int, log: dict,
+):
+    loop = asyncio.get_running_loop()
+    cancel = threading.Event()
+    started = time.monotonic()
+    generated = 0
+    summary = previous_summary
+    try:
+        yield sse({"type": "started", "fold_messages": fold_count, "input_tokens": input_tokens, "chunks": len(chunks)})
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = compaction.build_summary_prompt(summary, chunk)
+            queue: asyncio.Queue = asyncio.Queue()
+
+            def emit(piece):  # called from the worker thread
+                loop.call_soon_threadsafe(queue.put_nowait, piece)
+
+            task = loop.run_in_executor(None, compact_generate_stream, llm, prompt, emit, cancel)
+            chunk_started = time.monotonic()
+            since_event = 0
+            while True:
+                try:
+                    piece = await asyncio.wait_for(queue.get(), timeout=COMPACT_PROGRESS_SECONDS)
+                except asyncio.TimeoutError:  # heartbeat: queued behind an answer, or still reading the prompt
+                    yield sse({"type": "progress", "tokens": generated, "chunk": index, "chunks": len(chunks)})
+                    continue
+                if piece is None:
+                    break
+                if index == 1 and generated == 0:  # prompt-processing time (plus any wait for the lock), for tuning
+                    log["extra"]["first_token_s"] = round(time.monotonic() - chunk_started, 1)
+                generated += 1
+                since_event += 1
+                if since_event >= COMPACT_PROGRESS_TOKENS:
+                    since_event = 0
+                    yield sse({"type": "progress", "tokens": generated, "chunk": index, "chunks": len(chunks)})
+            raw, finish = await task  # re-raises anything the worker hit
+            text = compaction.extract_summary(raw)
+            if finish == "length":  # hit the token cap mid-summary: drop the dangling fragment
+                text = compaction.trim_to_sentence(text)
+            summary = compaction.validate_summary(text, SUMMARY_MAX_CHARS)  # ValueError -> error event below
+
+        summary_tokens = count_tokens(llm, summary)
+        log["status"], log["final_answer"] = "compaction_ok", summary
+        log["extra"].update(output_tokens=generated, summary_tokens=summary_tokens, summary_covers=new_covers)
+        yield sse({"type": "summary", "summary": summary, "summary_covers": new_covers, "summary_tokens": summary_tokens})
+        yield sse({"type": "done"})
+    except Exception as exc:
+        log["status"], log["error"] = "compaction_error", str(exc)
+        yield sse({"type": "error", "text": f"Could not condense the conversation: {exc}"})
+    finally:
+        cancel.set()
+        log["latency_s"] = round(time.monotonic() - started, 1)
+
+
+@app.post("/chat/compact", dependencies=[Depends(require_api_key)])
+async def chat_compact(req: CompactRequest):
+    """Fold `previous summary + the older messages` into one new summary and
+    stream progress. A separate request from the answer stream on purpose: an
+    answer can take ~470s of generation plus prefill, and Cloud Run's request
+    limit is 600s, so doing both in one request could time out."""
+    llm = STATE.get("llm")
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model still loading.")
+    try:
+        summary, covers = compaction.resolve_summary(
+            req.summary, req.summary_covers, len(req.messages) + 1, SUMMARY_MAX_CHARS
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    start, end = compaction.select_fold_range(req.messages, covers, KEEP_RECENT_MESSAGES)
+    to_fold = normalize_history(req.messages[start:end])
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    if end <= start or not to_fold:  # nothing to fold: a graceful no-op, not an error
+
+        async def nothing():
+            yield sse({"type": "started", "fold_messages": 0, "input_tokens": 0, "chunks": 0})
+            yield sse({"type": "done"})
+
+        return StreamingResponse(nothing(), media_type="text/event-stream", headers=headers)
+
+    chunks = compaction.plan_chunks(
+        to_fold, summary, lambda t: count_tokens(llm, t),
+        input_max_tokens=COMPACT_INPUT_MAX_TOKENS, summary_max_tokens=SUMMARY_MAX_TOKENS,
+    )
+    input_tokens = (
+        count_tokens(llm, compaction.build_summary_prompt(summary, [])) + sum(
+            count_tokens(llm, m["content"]) + MESSAGE_OVERHEAD_TOKENS for ch in chunks for m in ch
+        )
+    )
+    log = chatlog.new_log(MODEL_PATH, INSTANCE_ID, req.session_id)
+    log["question"] = f"[compaction] folding {end - start} messages in {len(chunks)} chunk(s)"
+    log["extra"] = {
+        "fold_messages": end - start, "chunks": len(chunks), "input_tokens": input_tokens,
+        "previous_summary_tokens": count_tokens(llm, summary) if summary else 0,
+    }
+    return StreamingResponse(
+        stream_compact(llm, summary, chunks, end - start, end, input_tokens, log),
+        media_type="text/event-stream",
+        headers=headers,
         background=BackgroundTask(chatlog.persist, log),
     )
 
