@@ -1,29 +1,13 @@
-import { AssistantRuntimeProvider, useLocalRuntime } from "@assistant-ui/react";
-import type { ThreadMessageLike } from "@assistant-ui/react";
-import { MoonIcon, SunIcon } from "lucide-react";
-import { useEffect, useState } from "react";
-import { Composer } from "@/components/composer";
-import { clearStoredDocs } from "@/components/documents-bar";
-import { Thread } from "@/components/thread";
-import { reconcileSummary, resetCompaction, toHistory } from "@/lib/compaction";
-import { gemmaChatAdapter } from "@/lib/gemma-adapter";
-import { checkServerRestarted, resetSessionId } from "@/lib/session";
+import { MenuIcon, MoonIcon, PlusIcon, SunIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ChatSession } from "@/components/chat-session";
+import { Sidebar } from "@/components/sidebar";
+import { checkServerRestarted } from "@/lib/session";
+import { invalidateAllDocs, newChat, useSessionStore } from "@/lib/sessions";
+import { useAutoTitles } from "@/lib/titles";
+import { cn } from "@/lib/utils";
 
-const HISTORY_STORAGE = "agent_history_v2";
 const THEME_STORAGE = "agent_theme";
-
-function loadHistory(): ThreadMessageLike[] {
-  let messages: ThreadMessageLike[] = [];
-  try {
-    messages = JSON.parse(localStorage.getItem(HISTORY_STORAGE) ?? "[]");
-  } catch {
-    messages = [];
-  }
-  // A stored summary only makes sense next to the messages it was made from;
-  // if those were truncated or cleared, drop it.
-  reconcileSummary(toHistory(messages));
-  return messages;
-}
 
 function useTheme() {
   const [theme, setTheme] = useState<"light" | "dark" | null>(
@@ -42,12 +26,14 @@ function useTheme() {
 }
 
 function Header({
-  hasHistory,
+  title,
+  onOpenSidebar,
   onNewChat,
   theme,
   onToggleTheme,
 }: {
-  hasHistory: boolean;
+  title: string;
+  onOpenSidebar: () => void;
   onNewChat: () => void;
   theme: "light" | "dark" | null;
   onToggleTheme: () => void;
@@ -55,105 +41,69 @@ function Header({
   const prefersDark =
     typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches;
   const isDark = theme === "dark" || (theme === null && prefersDark);
+  const iconButton =
+    "flex size-8 shrink-0 items-center justify-center rounded-full text-[var(--fg-muted)] hover:bg-[var(--bg-soft)] hover:text-[var(--fg)]";
   return (
     <header className="flex items-center gap-2 border-b border-[var(--line)] px-4 py-2.5">
-      <span className="text-sm font-medium text-[var(--fg)]">gemma-agent</span>
-      <div className="flex-1" />
-      <button
-        type="button"
-        onClick={onToggleTheme}
-        aria-label="Toggle theme"
-        className="flex size-8 items-center justify-center rounded-full text-[var(--fg-muted)] hover:bg-[var(--bg-soft)] hover:text-[var(--fg)]"
-      >
+      <button type="button" onClick={onOpenSidebar} aria-label="Open chat list" className={cn(iconButton, "md:hidden")}>
+        <MenuIcon className="size-4" />
+      </button>
+      <span className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--fg)]">{title}</span>
+      <button type="button" onClick={onToggleTheme} aria-label="Toggle theme" className={iconButton}>
         {isDark ? <SunIcon className="size-4" /> : <MoonIcon className="size-4" />}
       </button>
-      <button
-        type="button"
-        onClick={onNewChat}
-        disabled={!hasHistory}
-        className="rounded-md border border-[var(--line)] px-2.5 py-1 text-xs text-[var(--fg-muted)] hover:text-[var(--fg)] disabled:opacity-40"
-      >
-        New chat
+      <button type="button" onClick={onNewChat} aria-label="New chat" className={cn(iconButton, "md:hidden")}>
+        <PlusIcon className="size-4" />
       </button>
     </header>
   );
 }
 
-/**
- * Owns the actual runtime + its persistence subscription. Remounted (via the
- * `key` its parent assigns) whenever "New chat" starts a fresh session —
- * useLocalRuntime only reads initialMessages on mount, so a genuinely new
- * mount is what clearing history requires, not just re-rendering in place.
- */
-function ChatSession({
-  initialMessages,
-  theme,
-  onToggleTheme,
-  onNewChat,
-}: {
-  initialMessages: ThreadMessageLike[];
-  theme: "light" | "dark" | null;
-  onToggleTheme: () => void;
-  onNewChat: () => void;
-}) {
-  const runtime = useLocalRuntime(gemmaChatAdapter, { initialMessages });
-
-  useEffect(() => {
-    return runtime.thread.subscribe(() => {
-      const messages = runtime.thread.getState().messages;
-      localStorage.setItem(HISTORY_STORAGE, JSON.stringify(messages));
-    });
-  }, [runtime]);
-
-  return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <div className="flex h-full flex-col">
-        <Header
-          hasHistory={initialMessages.length > 0}
-          onNewChat={onNewChat}
-          theme={theme}
-          onToggleTheme={onToggleTheme}
-        />
-        <Thread />
-        <Composer />
-      </div>
-    </AssistantRuntimeProvider>
-  );
-}
-
 export default function App() {
   const [theme, setTheme] = useTheme();
-  const [generation, setGeneration] = useState(0);
-  const [initialMessages, setInitialMessages] = useState<ThreadMessageLike[]>(loadHistory);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const { sessions, activeId, running, busy } = useSessionStore();
+  useAutoTitles();
 
   useEffect(() => {
     void checkServerRestarted().then((restarted) => {
-      if (restarted) clearStoredDocs();
+      if (restarted) invalidateAllDocs();
     });
   }, []);
 
-  function handleNewChat() {
-    if (
-      initialMessages.length > 0 &&
-      !window.confirm("Start a new chat? This clears the conversation and any attached documents.")
-    ) {
-      return;
-    }
-    localStorage.removeItem(HISTORY_STORAGE);
-    clearStoredDocs();
-    resetCompaction(); // forgets the summary and stops a compaction still in flight
-    resetSessionId();
-    setInitialMessages([]);
-    setGeneration((g) => g + 1);
-  }
+  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
+
+  // The open chat, plus any chat still generating a reply: those stay mounted
+  // (hidden) so their stream keeps running while you look at another chat.
+  const mountedIds = useMemo(
+    () => [activeId, ...running.filter((id) => id !== activeId)],
+    [activeId, running],
+  );
+
+  const titleOf = (id: string) => sessions.find((s) => s.id === id)?.title;
+  // The model serves one request at a time, so sending is held while another chat is using it.
+  const otherRunning = busy.find((id) => id !== activeId);
+  const blockedBy = otherRunning ? (titleOf(otherRunning) ?? "another chat") : null;
 
   return (
-    <ChatSession
-      key={generation}
-      initialMessages={initialMessages}
-      theme={theme}
-      onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
-      onNewChat={handleNewChat}
-    />
+    <div className="flex h-full">
+      <Sidebar open={drawerOpen} onClose={closeDrawer} />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <Header
+          title={titleOf(activeId) ?? "gemma-agent"}
+          onOpenSidebar={() => setDrawerOpen(true)}
+          onNewChat={newChat}
+          theme={theme}
+          onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
+        />
+        <div className="relative min-h-0 flex-1">
+          {mountedIds.map((id) => (
+            <div key={id} className={cn("absolute inset-0 flex-col", id === activeId ? "flex" : "hidden")}>
+              <ChatSession sessionId={id} blockedBy={id === activeId ? blockedBy : null} />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }

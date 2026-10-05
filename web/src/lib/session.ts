@@ -1,8 +1,7 @@
 const API_KEY_STORAGE = "agent_api_key";
-const SESSION_ID_STORAGE = "agent_session_id";
 const INSTANCE_ID_STORAGE = "agent_instance_id";
 
-function newId(): string {
+export function newId(): string {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -15,21 +14,6 @@ export function getApiKey(): string {
   const entered = window.prompt("API key for this agent (leave blank if none set):") ?? "";
   localStorage.setItem(API_KEY_STORAGE, entered);
   return entered;
-}
-
-export function getSessionId(): string {
-  let id = localStorage.getItem(SESSION_ID_STORAGE);
-  if (!id) {
-    id = newId();
-    localStorage.setItem(SESSION_ID_STORAGE, id);
-  }
-  return id;
-}
-
-export function resetSessionId(): string {
-  const id = newId();
-  localStorage.setItem(SESSION_ID_STORAGE, id);
-  return id;
 }
 
 /**

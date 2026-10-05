@@ -1,11 +1,14 @@
 import { useSyncExternalStore } from "react";
+import { useSessionId } from "./session-context";
 
 /**
  * Client side of summarization-based compaction (server: compaction.py and
  * /chat/compact in app.py).
  *
  * The CLIENT owns the summary, so the stateless server survives restarts and
- * a second Cloud Run instance. Per chat we keep:
+ * a second Cloud Run instance. Everything here is per chat (keyed by session
+ * id), because several chats can be open at once: each has its own stored
+ * summary, banner state and in-flight compaction. For each chat we keep:
  *   summary  - model-written text covering the first `covers` messages
  *   covers   - how many leading messages of the raw message list (user and
  *              assistant messages with text, see toHistory) it replaces
@@ -17,7 +20,11 @@ import { useSyncExternalStore } from "react";
  * older history shortening still applies).
  */
 
-const SUMMARY_STORAGE = "agent_summary_v1";
+/** Where a chat's summary is stored. Chats created before multi-session
+ * support kept one global summary under LEGACY_SUMMARY_STORAGE; the session
+ * store moves it into the first chat's key on upgrade. */
+export const summaryStorageKey = (sessionId: string) => `agent_session_${sessionId}_summary`;
+export const LEGACY_SUMMARY_STORAGE = "agent_summary_v1";
 
 export type HistoryMessage = { role: "user" | "assistant"; content: string };
 
@@ -96,9 +103,9 @@ function anchorOf(history: readonly HistoryMessage[], covers: number): string {
 // Persistence
 // ---------------------------------------------------------------------------
 
-function loadStored(): StoredSummary | null {
+function loadStored(sessionId: string): StoredSummary | null {
   try {
-    const raw = JSON.parse(localStorage.getItem(SUMMARY_STORAGE) ?? "null");
+    const raw = JSON.parse(localStorage.getItem(summaryStorageKey(sessionId)) ?? "null");
     if (
       raw &&
       typeof raw.summary === "string" &&
@@ -120,9 +127,9 @@ function loadStored(): StoredSummary | null {
   return null;
 }
 
-function saveStored(value: StoredSummary) {
+function saveStored(sessionId: string, value: StoredSummary) {
   try {
-    localStorage.setItem(SUMMARY_STORAGE, JSON.stringify(value));
+    localStorage.setItem(summaryStorageKey(sessionId), JSON.stringify(value));
   } catch {
     // storage full or blocked: the summary still works for this page load
   }
@@ -132,7 +139,7 @@ function saveStored(value: StoredSummary) {
 // Observable state (banner, composer, transcript divider)
 // ---------------------------------------------------------------------------
 
-function idleView(): CompactionView {
+function idleView(sessionId: string): CompactionView {
   return {
     phase: "idle",
     startedAt: 0,
@@ -141,15 +148,36 @@ function idleView(): CompactionView {
     chunk: 0,
     tokens: 0,
     error: "",
-    dividerIndex: loadStored()?.dividerIndex ?? null,
+    dividerIndex: loadStored(sessionId)?.dividerIndex ?? null,
   };
 }
 
-let view: CompactionView = idleView();
+/** Per-chat runtime state. `epoch` makes a compaction that is still running
+ * discard its result after a reset; `activeAbort` / `pendingChoice` are the
+ * handles reset needs to stop it. */
+type Controller = {
+  view: CompactionView;
+  epoch: number;
+  activeAbort: AbortController | null;
+  pendingChoice: ((choice: "retry" | "continue") => void) | null;
+};
+
+let epochCounter = 0; // global, so a deleted-and-recreated controller never reuses an epoch
+const controllers = new Map<string, Controller>();
 const listeners = new Set<() => void>();
 
-function setView(patch: Partial<CompactionView>) {
-  view = { ...view, ...patch };
+function controller(sessionId: string): Controller {
+  let c = controllers.get(sessionId);
+  if (!c) {
+    c = { view: idleView(sessionId), epoch: ++epochCounter, activeAbort: null, pendingChoice: null };
+    controllers.set(sessionId, c);
+  }
+  return c;
+}
+
+function setView(sessionId: string, patch: Partial<CompactionView>) {
+  const c = controller(sessionId);
+  c.view = { ...c.view, ...patch };
   listeners.forEach((l) => l());
 }
 
@@ -160,61 +188,71 @@ function subscribe(listener: () => void) {
   };
 }
 
-export function useCompactionView(): CompactionView {
-  return useSyncExternalStore(subscribe, () => view);
+/** A chat's compaction state. Without an argument it is the chat the calling
+ * component is rendered in (see SessionIdContext). */
+export function useCompactionView(sessionId?: string): CompactionView {
+  const fromContext = useSessionId();
+  const id = sessionId ?? fromContext;
+  return useSyncExternalStore(subscribe, () => controller(id).view);
 }
 
 /** Current state outside React (tests and scripts). */
-export function getCompactionView(): CompactionView {
-  return view;
+export function getCompactionView(sessionId: string): CompactionView {
+  return controller(sessionId).view;
 }
 
 // ---------------------------------------------------------------------------
 // Using and invalidating the stored summary
 // ---------------------------------------------------------------------------
 
-/** Forget the summary and stop any compaction in flight. Called on "New chat";
- * the epoch makes a compaction that is still running discard its result. */
-let epoch = 0;
-let activeAbort: AbortController | null = null;
-let pendingChoice: ((choice: "retry" | "continue") => void) | null = null;
-
-export function resetCompaction() {
-  epoch++;
-  activeAbort?.abort();
-  activeAbort = null;
-  pendingChoice?.("continue");
-  pendingChoice = null;
+/** Forget a chat's summary and stop any compaction in flight for it. The
+ * epoch makes a compaction that is still running discard its result. */
+export function resetCompaction(sessionId: string) {
+  const c = controller(sessionId);
+  c.epoch = ++epochCounter;
+  c.activeAbort?.abort();
+  c.activeAbort = null;
+  c.pendingChoice?.("continue");
+  c.pendingChoice = null;
   try {
-    localStorage.removeItem(SUMMARY_STORAGE);
+    localStorage.removeItem(summaryStorageKey(sessionId));
   } catch {
     // ignore
   }
-  setView({ ...idleView(), dividerIndex: null });
+  setView(sessionId, { ...idleView(sessionId), dividerIndex: null });
+}
+
+/** A chat was deleted: reset it and forget its controller. */
+export function dropCompaction(sessionId: string) {
+  resetCompaction(sessionId);
+  controllers.delete(sessionId);
 }
 
 /** Drops a stored summary that no longer matches the messages (history was
  * truncated, edited or cleared). `maxCovers` is how many leading messages a
  * valid summary may cover. */
-function validStored(history: readonly HistoryMessage[], maxCovers: number): StoredSummary | null {
-  const stored = loadStored();
+function validStored(sessionId: string, history: readonly HistoryMessage[], maxCovers: number): StoredSummary | null {
+  const stored = loadStored(sessionId);
   if (!stored) return null;
   if (stored.covers > maxCovers || stored.anchor !== anchorOf(history, stored.covers)) {
-    resetCompaction();
+    resetCompaction(sessionId);
     return null;
   }
   return stored;
 }
 
-/** Called once when persisted chat history is loaded. */
-export function reconcileSummary(history: readonly HistoryMessage[]) {
-  validStored(history, history.length);
+/** Called once when a chat's persisted history is loaded. */
+export function reconcileSummary(sessionId: string, history: readonly HistoryMessage[]) {
+  validStored(sessionId, history, history.length);
 }
 
 /** The fields to add to a chat request. `history` ends with the new question,
  * which must stay uncovered. */
-export function summaryPayload(history: readonly HistoryMessage[]): { summary?: string; summary_covers?: number } {
-  const stored = validStored(history, history.length - 1);
+export function summaryPayload(
+  sessionId: string,
+  history: readonly HistoryMessage[],
+): { summary?: string; summary_covers?: number } {
+  const stored = validStored(sessionId, history, history.length - 1);
   return stored ? { summary: stored.summary, summary_covers: stored.covers } : {};
 }
 
@@ -285,10 +323,15 @@ async function requestCompaction(
   for await (const evt of sseEvents(res.body)) {
     switch (evt.type) {
       case "started":
-        setView({ foldMessages: evt.fold_messages, chunks: evt.chunks, chunk: evt.chunks ? 1 : 0, tokens: 0 });
+        setView(ctx.sessionId, {
+          foldMessages: evt.fold_messages,
+          chunks: evt.chunks,
+          chunk: evt.chunks ? 1 : 0,
+          tokens: 0,
+        });
         break;
       case "progress":
-        setView({ tokens: evt.tokens, ...(evt.chunk ? { chunk: evt.chunk } : {}) });
+        setView(ctx.sessionId, { tokens: evt.tokens, ...(evt.chunk ? { chunk: evt.chunk } : {}) });
         break;
       case "summary":
         result = { summary: evt.summary, covers: evt.summary_covers };
@@ -304,26 +347,27 @@ async function requestCompaction(
   return result;
 }
 
-function waitForChoice(signal: AbortSignal): Promise<"retry" | "continue"> {
+function waitForChoice(sessionId: string, signal: AbortSignal): Promise<"retry" | "continue"> {
+  const c = controller(sessionId);
   return new Promise((resolve) => {
     const finish = (choice: "retry" | "continue") => {
-      pendingChoice = null;
+      c.pendingChoice = null;
       signal.removeEventListener("abort", onAbort);
       resolve(choice);
     };
     const onAbort = () => finish("continue");
-    pendingChoice = finish;
+    c.pendingChoice = finish;
     signal.addEventListener("abort", onAbort);
   });
 }
 
-export function retryCompaction() {
-  pendingChoice?.("retry");
+export function retryCompaction(sessionId: string) {
+  controller(sessionId).pendingChoice?.("retry");
 }
 
 /** "Continue anyway": keep chatting without a (new) summary. */
-export function skipCompaction() {
-  pendingChoice?.("continue");
+export function skipCompaction(sessionId: string) {
+  controller(sessionId).pendingChoice?.("continue");
 }
 
 /**
@@ -340,18 +384,21 @@ export async function compactConversation(args: {
   sessionId: string;
   signal: AbortSignal;
 }): Promise<void> {
-  const myEpoch = epoch;
+  const id = args.sessionId;
+  const c = controller(id);
+  const myEpoch = c.epoch;
   const own = new AbortController();
   const forward = () => own.abort();
   args.signal.addEventListener("abort", forward);
-  activeAbort = own;
-  const live = () => myEpoch === epoch && !own.signal.aborted;
+  c.activeAbort = own;
+  // `controllers.get(id) === c` also ends the run if the chat was deleted meanwhile.
+  const live = () => controllers.get(id) === c && myEpoch === c.epoch && !own.signal.aborted;
 
-  setView({ phase: "running", startedAt: Date.now(), foldMessages: 0, chunks: 0, chunk: 0, tokens: 0, error: "" });
+  setView(id, { phase: "running", startedAt: Date.now(), foldMessages: 0, chunks: 0, chunk: 0, tokens: 0, error: "" });
   try {
     while (live()) {
       try {
-        const previous = loadStored();
+        const previous = loadStored(id);
         const result = await requestCompaction(args.history, previous, {
           apiKey: args.apiKey,
           sessionId: args.sessionId,
@@ -359,26 +406,26 @@ export async function compactConversation(args: {
         });
         if (!live()) return; // New chat or Stop pressed meanwhile: drop the result
         if (result && result.covers > 0 && result.covers < args.history.length) {
-          saveStored({
+          saveStored(id, {
             summary: result.summary,
             covers: result.covers,
             anchor: anchorOf(args.history, result.covers),
             dividerIndex: threadIndexOf(args.threadMessages, result.covers),
           });
-          setView({ dividerIndex: threadIndexOf(args.threadMessages, result.covers) });
+          setView(id, { dividerIndex: threadIndexOf(args.threadMessages, result.covers) });
         }
         return;
       } catch (err) {
         if (!live()) return;
-        setView({ phase: "error", error: err instanceof Error ? err.message : String(err) });
-        const choice = await waitForChoice(own.signal);
+        setView(id, { phase: "error", error: err instanceof Error ? err.message : String(err) });
+        const choice = await waitForChoice(id, own.signal);
         if (choice === "continue" || !live()) return;
-        setView({ phase: "running", startedAt: Date.now(), foldMessages: 0, chunks: 0, chunk: 0, tokens: 0, error: "" });
+        setView(id, { phase: "running", startedAt: Date.now(), foldMessages: 0, chunks: 0, chunk: 0, tokens: 0, error: "" });
       }
     }
   } finally {
     args.signal.removeEventListener("abort", forward);
-    if (activeAbort === own) activeAbort = null;
-    if (myEpoch === epoch) setView({ phase: "idle", error: "" });
+    if (c.activeAbort === own) c.activeAbort = null;
+    if (controllers.get(id) === c && myEpoch === c.epoch) setView(id, { phase: "idle", error: "" });
   }
 }

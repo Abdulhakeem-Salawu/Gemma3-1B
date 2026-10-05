@@ -1,39 +1,20 @@
 import { PaperclipIcon } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { getApiKey, getSessionId } from "@/lib/session";
-
-type DocEntry = { name: string; chunks: number };
-const DOCS_STORAGE = "agent_docs";
-
-function loadDocs(): DocEntry[] {
-  try {
-    return JSON.parse(localStorage.getItem(DOCS_STORAGE) ?? "[]");
-  } catch {
-    return [];
-  }
-}
-
-/** Called when a server restart is detected, so the (now stale) doc list
- * gets dropped client-side too — see checkServerRestarted() in lib/session. */
-export function clearStoredDocs() {
-  localStorage.removeItem(DOCS_STORAGE);
-}
+import { useRef, useState } from "react";
+import { getApiKey } from "@/lib/session";
+import { getDocs, setDocs, useSessionDocs } from "@/lib/sessions";
 
 /**
  * Upload/clear bar for session-scoped RAG documents, rendered directly above
  * the composer's input row. Kept as a standalone component rather than
  * assistant-ui's per-message AttachmentAdapter: uploads here persist for the
- * whole session and ground every subsequent question, not just one message.
+ * whole chat and ground every subsequent question, not just one message.
+ * The chips live in the session store, one list per chat.
  */
-export function DocumentsBar({ disabled }: { disabled?: boolean }) {
-  const [docs, setDocs] = useState<DocEntry[]>(loadDocs);
+export function DocumentsBar({ sessionId, disabled }: { sessionId: string; disabled?: boolean }) {
+  const docs = useSessionDocs(sessionId);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    localStorage.setItem(DOCS_STORAGE, JSON.stringify(docs));
-  }, [docs]);
 
   async function upload(file: File) {
     setBusy(true);
@@ -41,14 +22,14 @@ export function DocumentsBar({ disabled }: { disabled?: boolean }) {
     try {
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch(`/kb/upload?session_id=${encodeURIComponent(getSessionId())}`, {
+      const res = await fetch(`/kb/upload?session_id=${encodeURIComponent(sessionId)}`, {
         method: "POST",
         headers: { "x-api-key": getApiKey() },
         body: form,
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || `Upload failed (${res.status})`);
-      setDocs((prev) => [...prev, { name: body.filename, chunks: body.total_chunks }]);
+      setDocs(sessionId, [...getDocs(sessionId), { name: body.filename, chunks: body.total_chunks }]);
       setStatus(`${file.name}: added ${body.chunks_added} chunk(s)`);
     } catch (err) {
       setStatus(`${file.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -63,12 +44,12 @@ export function DocumentsBar({ disabled }: { disabled?: boolean }) {
       await fetch("/kb/clear", {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": getApiKey() },
-        body: JSON.stringify({ session_id: getSessionId() }),
+        body: JSON.stringify({ session_id: sessionId }),
       });
     } catch {
       // best effort — clear the client list regardless
     }
-    setDocs([]);
+    setDocs(sessionId, []);
     setStatus("");
   }
 
