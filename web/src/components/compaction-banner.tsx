@@ -1,6 +1,7 @@
 import { LoaderCircleIcon, TriangleAlertIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { retryCompaction, skipCompaction, useCompactionView } from "@/lib/compaction";
+import { useSessionId } from "@/lib/session-context";
 
 function formatElapsed(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
@@ -47,6 +48,7 @@ function RunningBody({ startedAt }: { startedAt: number }) {
  * input is locked meanwhile), or when that failed and the user has to choose
  * between trying again and carrying on without it. */
 export function CompactionBanner() {
+  const sessionId = useSessionId();
   const view = useCompactionView();
   if (view.phase === "idle") return null;
 
@@ -68,14 +70,14 @@ export function CompactionBanner() {
               <div className="mt-2 flex gap-2">
                 <button
                   type="button"
-                  onClick={retryCompaction}
+                  onClick={() => retryCompaction(sessionId)}
                   className="rounded-md bg-[var(--accent)] px-2.5 py-1 text-xs text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
                 >
                   Retry
                 </button>
                 <button
                   type="button"
-                  onClick={skipCompaction}
+                  onClick={() => skipCompaction(sessionId)}
                   className="rounded-md border border-[var(--line)] px-2.5 py-1 text-xs text-[var(--fg-muted)] hover:text-[var(--fg)]"
                 >
                   Continue anyway
