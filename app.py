@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import functools
 import io
 import ipaddress
@@ -36,7 +37,9 @@ MODEL_PATH = os.getenv("MODEL_PATH", "/mnt/models/gemma-3-1b-it-q4_0.gguf")
 APP_API_KEY = os.getenv("APP_API_KEY")  # set in production; unset = no auth (local dev only)
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 MCP_SERVER_URLS = [u.strip() for u in os.getenv("MCP_SERVER_URLS", "").split(",") if u.strip()]
-MAX_TOOL_HOPS = 15  # raised from 4 — a higher ceiling means a worse-case tool-looping request takes proportionally longer; watch it against timeoutSeconds (600s) and per-hop latency
+MAX_TOOL_HOPS = 6  # was 15, then 4 before that. Production chat_logs show every chat that reached a real answer finished within 3 hops; chats that got stuck were only ever recovered by the loop guard below, never by having more hops available. A lower ceiling bounds worst-case latency, and combined with force_finalize() below, hitting it no longer means a wasted request.
+TOOL_SIMILARITY_THRESHOLD = float(os.getenv("TOOL_SIMILARITY_THRESHOLD", "0.82"))  # a new tool call this close (same tool, fuzzy-matched arguments vs. ANY earlier call this turn) counts as a repeat, not just a byte-identical one — logs showed a 6-hop chat rephrasing one search five times without ever repeating a query exactly
+TOOL_HOP_BUDGET_MARGIN_TOKENS = 300  # headroom kept free, on top of MAX_GENERATION_TOKENS, while the tool loop is still running — turns.append() during the loop was never checked against n_ctx, so a long run of tool results could in principle overflow it the same way unbounded history once did
 MAX_HISTORY_MESSAGES = 40  # upper bound on messages considered; the token budget in build_turns is what actually protects n_ctx
 N_CTX = int(os.getenv("N_CTX", "4096"))
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "4"))  # match the Cloud Run --cpu value
@@ -160,7 +163,7 @@ def read_webpage(url: str) -> str:
 BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
     "get_market_snapshot": {
         "handler": get_market_snapshot,
-        "description": "Get the latest price and recent headlines for a ticker symbol.",
+        "description": "Get the latest price and recent headlines for a ticker symbol. Only call this when the user names a specific ticker/company or asks for a current price or quote — never for general business, product, feature or competitor questions.",
         "parameters": {
             "type": "object",
             "properties": {"ticker": {"type": "string", "description": "e.g. BTC-USD, AAPL, XAUUSD=X"}},
@@ -418,6 +421,14 @@ DECISION_SCHEMA = {
     "required": ["thinking", "action", "tool_name", "tool_arguments", "final_answer"],
 }
 
+# A second, stricter schema used only by force_finalize(): same shape, but
+# "action" can only be "final_answer", so a forced finalize can never itself
+# turn into another tool_call.
+FINAL_ANSWER_SCHEMA = {
+    **DECISION_SCHEMA,
+    "properties": {**DECISION_SCHEMA["properties"], "action": {"type": "string", "enum": ["final_answer"]}},
+}
+
 INSTRUCTIONS_TEMPLATE = """You are a friendly, knowledgeable assistant who explains things clearly and in depth, like a good teacher. Answer normally from your own knowledge.
 
 You also have these tools:
@@ -427,6 +438,7 @@ Rules:
 - First, fill "thinking" with ONE short sentence (max 15 words) of your own reasoning about how to answer. The user can see this, so never write more than that.
 - Greetings, general questions: answer directly with action "final_answer". Do not use a tool.
 - Use "tool_call" ONLY when the user asks for current prices, market data or recent news/facts that a tool can fetch.
+- get_market_snapshot needs a specific ticker symbol the user named; never call it for general business, product, feature or competitor questions, even if a related company name came up earlier.
 - If context from uploaded documents is given above and it answers the question, use it and say so. If it's there but doesn't cover the question, say it doesn't rather than guessing.
 - Never invent prices, dates or news. If it did not come from a tool result or the document context above, do not state it.
 - Match the depth of your answer to the question. For greetings and simple facts, one or two sentences. For anything that asks for an explanation, details, examples, a comparison, a how-to, advice, analysis or writing (this includes follow-ups like "tell me more", "explain in detail" or "give examples"), write a full, rich answer of at least 250 words (usually 300-500): open with a direct answer, then develop it by explaining the why, giving 2-4 concrete examples, and ending with a practical tip or takeaway. Never answer a request for detail in just a few sentences.
@@ -785,15 +797,19 @@ def sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
-def generate_stream(llm: Llama, turns: list[dict], emit, cancel: threading.Event) -> str:
+def generate_stream(
+    llm: Llama, turns: list[dict], emit, cancel: threading.Event, schema: dict = DECISION_SCHEMA
+) -> str:
     """Runs in a worker thread. Calls emit(piece) for every raw token piece and
-    emit(None) once when the turn is over. Returns the full raw text."""
+    emit(None) once when the turn is over. Returns the full raw text. `schema`
+    defaults to the normal decision shape; force_finalize() passes
+    FINAL_ANSWER_SCHEMA so that call cannot itself emit another tool_call."""
     raw: list[str] = []
     try:
         with INFERENCE_LOCK:
             stream = llm.create_chat_completion(
                 messages=turns,
-                response_format={"type": "json_object", "schema": DECISION_SCHEMA},
+                response_format={"type": "json_object", "schema": schema},
                 temperature=0.6,
                 max_tokens=MAX_GENERATION_TOKENS,
                 stream=True,
@@ -813,40 +829,126 @@ def generate_stream(llm: Llama, turns: list[dict], emit, cancel: threading.Event
     return "".join(raw)
 
 
+def is_repeat_tool_call(
+    name: str,
+    args_json: str,
+    previous_calls: list[tuple[str, str]],
+    threshold: float = TOOL_SIMILARITY_THRESHOLD,
+) -> bool:
+    """True if (name, args_json) is close enough to any earlier call this turn
+    to count as a repeat: same tool, and canonical-JSON arguments at least
+    `threshold` similar by difflib's ratio (1.0 = identical). Catches a model
+    rephrasing the same search ("AI tools for X" / "AI tools for X and Y") as
+    well as an exact repeat, without needing an embedding model."""
+    for prev_name, prev_args in previous_calls:
+        if prev_name == name and difflib.SequenceMatcher(None, args_json, prev_args).ratio() >= threshold:
+            return True
+    return False
+
+
+async def run_decision(
+    loop, llm: Llama, turns: list[dict], cancel: threading.Event, result: dict, schema: dict = DECISION_SCHEMA
+):
+    """Runs one grammar-constrained generation, yielding SSE strings for
+    "thinking" and (if action is final_answer) "final_answer" as they stream.
+    Before returning, fills result["decision"] (None if the JSON was
+    malformed), result["raw"] and result["answered"] (whether final_answer
+    text was ever streamed). Shared by stream_reply's per-hop loop and by
+    force_finalize() below, so both stream identically to the client."""
+    queue: asyncio.Queue = asyncio.Queue()
+    thinking_streamer = StringFieldStreamer("thinking")
+    answer_streamer = StringFieldStreamer("final_answer", gate_key="action", gate_value="final_answer")
+    thinking_done_sent = False
+
+    def emit(piece):  # called from the worker thread
+        loop.call_soon_threadsafe(queue.put_nowait, piece)
+
+    task = loop.run_in_executor(None, generate_stream, llm, turns, emit, cancel, schema)
+    while (piece := await queue.get()) is not None:
+        think_text = thinking_streamer.feed(piece)
+        if think_text:
+            yield sse({"type": "thinking", "text": think_text})
+        if thinking_streamer.done and not thinking_done_sent:
+            thinking_done_sent = True
+            yield sse({"type": "thinking_done"})
+        answer_text = answer_streamer.feed(piece)
+        if answer_text:
+            yield sse({"type": "token", "text": answer_text})
+    raw = await task  # re-raises anything the worker hit
+    try:
+        result["decision"] = json.loads(raw)
+    except json.JSONDecodeError:
+        result["decision"] = None
+    result["raw"] = raw
+    result["answered"] = answer_streamer.emitted
+
+
+async def force_finalize(
+    loop, llm: Llama, turns: list[dict], log: dict, cancel: threading.Event, context_after, reason: str
+):
+    """One extra generation, grammar-locked to action "final_answer" (via
+    FINAL_ANSWER_SCHEMA), run when a tool loop is stuck, the hop budget is
+    reached, or the tool loop is about to overflow n_ctx. The model already
+    has every tool result so far in `turns`; this just gives it permission
+    (and a schema that forces it) to synthesize an answer from them instead
+    of searching again — turning what used to be a wasted multi-minute
+    request into a real, if partial, answer. Falls back to a short apology
+    only if this call also fails to produce one."""
+    nudge = {
+        "role": "user",
+        "content": "Tool calls are no longer available for this question. Using ONLY the tool results already "
+        "shown above, give your best final_answer now. If they do not fully answer the question, say what "
+        "you found and what is still unclear, in the same JSON shape with action \"final_answer\".",
+    }
+    result: dict = {}
+    async for event in run_decision(loop, llm, turns + [nudge], cancel, result, schema=FINAL_ANSWER_SCHEMA):
+        yield event
+    log["hops"] += 1
+    decision, raw = result["decision"], result["raw"]
+    answer = (decision.get("final_answer") or "").strip() if decision is not None else ""
+    log.setdefault("extra", {})["forced_finalize"] = reason
+
+    if answer:
+        log["status"], log["final_answer"] = f"{reason}_finalized", answer
+        if not result["answered"]:
+            yield sse({"type": "token", "text": answer})
+        done_event: dict = {"type": "done"}
+        if context_after is not None:  # normal completion only; never allowed to break a reply
+            try:
+                done_event["context"] = context_after(log["final_answer"])
+            except Exception as exc:
+                print(f"[compaction] could not compute context usage: {exc!r}")
+        yield sse(done_event)
+        return
+
+    log["status"] = reason
+    if decision is None:
+        log["final_answer"] = raw
+    yield sse(
+        {
+            "type": "token",
+            "text": "I wasn't able to pin that down with the tools available — try rephrasing the question.",
+        }
+    )
+    yield sse({"type": "done"})
+
+
 async def stream_reply(llm: Llama, turns: list[dict], log: dict, context_after=None):
     loop = asyncio.get_running_loop()
     cancel = threading.Event()
     started = time.monotonic()
-    last_call_signature: tuple[str, str] | None = None  # (name, sorted-args-json) of the previous hop's tool call
+    call_signatures: list[tuple[str, str]] = []  # (name, canonical-args-json) of every tool call made this turn
     try:
         for _ in range(MAX_TOOL_HOPS):
-            queue: asyncio.Queue = asyncio.Queue()
-            thinking_streamer = StringFieldStreamer("thinking")
-            answer_streamer = StringFieldStreamer("final_answer", gate_key="action", gate_value="final_answer")
-            thinking_done_sent = False
-
-            def emit(piece):  # called from the worker thread
-                loop.call_soon_threadsafe(queue.put_nowait, piece)
-
-            task = loop.run_in_executor(None, generate_stream, llm, turns, emit, cancel)
-            while (piece := await queue.get()) is not None:
-                think_text = thinking_streamer.feed(piece)
-                if think_text:
-                    yield sse({"type": "thinking", "text": think_text})
-                if thinking_streamer.done and not thinking_done_sent:
-                    thinking_done_sent = True
-                    yield sse({"type": "thinking_done"})
-                answer_text = answer_streamer.feed(piece)
-                if answer_text:
-                    yield sse({"type": "token", "text": answer_text})
-            raw = await task  # re-raises anything the worker hit
+            result: dict = {}
+            async for event in run_decision(loop, llm, turns, cancel, result):
+                yield event
+            raw, decision = result["raw"], result["decision"]
             log["hops"] += 1
 
-            try:
-                decision = json.loads(raw)
-            except json.JSONDecodeError:
+            if decision is None:
                 log["status"], log["final_answer"] = "malformed", raw
-                if not answer_streamer.emitted:
+                if not result["answered"]:
                     yield sse({"type": "token", "text": raw})
                 yield sse({"type": "done"})
                 return
@@ -855,42 +957,53 @@ async def stream_reply(llm: Llama, turns: list[dict], log: dict, context_after=N
             if decision.get("action") == "tool_call" and decision.get("tool_name"):
                 name = decision["tool_name"]
                 args = decision.get("tool_arguments") or {}
-                # A small model can get stuck re-issuing the identical call
-                # instead of using its result — with MAX_TOOL_HOPS raised to
-                # 15, that would otherwise burn every remaining hop (and its
-                # full generation latency) before the fallback below kicks
-                # in. Catch it after one repeat rather than fifteen.
-                signature = (name, json.dumps(args, sort_keys=True, default=str))
-                if signature == last_call_signature:
+                args_json = json.dumps(args, sort_keys=True, default=str)
+                # A small model can get stuck re-issuing the same lookup, often
+                # reworded rather than byte-identical (logs: five rewordings of
+                # one search, none an exact repeat) — compare against every
+                # earlier call this turn, fuzzily, not just the last one.
+                if is_repeat_tool_call(name, args_json, call_signatures):
                     log["status"] = "tool_loop"
-                    yield sse(
-                        {
-                            "type": "token",
-                            "text": f"That lookup ({name}) repeated without new information, so I stopped early "
-                            "rather than keep retrying — try rephrasing the question.",
-                        }
-                    )
-                    yield sse({"type": "done"})
+                    async for event in force_finalize(loop, llm, turns, log, cancel, context_after, "tool_loop"):
+                        yield event
                     return
-                last_call_signature = signature
+                call_signatures.append((name, args_json))
 
                 tool_call_id = uuid.uuid4().hex
                 yield sse({"type": "tool", "tool_call_id": tool_call_id, "name": name, "args": args})
-                result = await dispatch_tool(name, args)
-                yield sse({"type": "tool_result", "tool_call_id": tool_call_id, "result": result})
-                log["tool_calls"].append({"name": name, "args": args, "result": result})
+                result_text = await dispatch_tool(name, args)
+                yield sse({"type": "tool_result", "tool_call_id": tool_call_id, "result": result_text})
+                log["tool_calls"].append({"name": name, "args": args, "result": result_text})
+                hop_hint = (
+                    " You have already used tools more than once \u2014 if that is enough to answer, reply with "
+                    'action "final_answer" now instead of searching again, and avoid repeating a very similar '
+                    "search."
+                    if log["hops"] >= 2
+                    else ""
+                )
                 turns.append({"role": "assistant", "content": raw})
                 turns.append(
                     {
                         "role": "user",
-                        "content": f"[Result of {name}]\n{result}\n\nContinue: answer the original question, "
-                        f"or call another tool if you still need to, in the same JSON shape.",
+                        "content": f"[Result of {name}]\n{result_text}\n\nContinue: answer the original question, "
+                        f"or call another tool if you still need to, in the same JSON shape.{hop_hint}",
                     }
                 )
+                # The append above was never checked against n_ctx — a long
+                # enough run of tool results could in principle overflow it the
+                # same way unbounded history once did. If there is no longer
+                # room for another hop's generation, stop growing `turns` and
+                # finalize now instead of risking an inference error.
+                used = sum(count_tokens(llm, t["content"]) for t in turns) + PROMPT_MARGIN_TOKENS
+                if used > N_CTX - MAX_GENERATION_TOKENS - TOOL_HOP_BUDGET_MARGIN_TOKENS:
+                    log["status"] = "tool_budget"
+                    async for event in force_finalize(loop, llm, turns, log, cancel, context_after, "tool_budget"):
+                        yield event
+                    return
                 continue
 
             log["status"], log["final_answer"] = "ok", decision.get("final_answer") or ""
-            if not answer_streamer.emitted:  # fallback if the answer never streamed
+            if not result["answered"]:  # fallback if the answer never streamed
                 yield sse({"type": "token", "text": decision.get("final_answer", "")})
             done_event: dict = {"type": "done"}
             if context_after is not None:  # normal completion only; never allowed to break a reply
@@ -901,9 +1014,8 @@ async def stream_reply(llm: Llama, turns: list[dict], log: dict, context_after=N
             yield sse(done_event)
             return
 
-        log["status"] = "tool_limit"
-        yield sse({"type": "token", "text": "Reached the tool-call limit without a final answer — try rephrasing."})
-        yield sse({"type": "done"})
+        async for event in force_finalize(loop, llm, turns, log, cancel, context_after, "tool_limit"):
+            yield event
     except Exception as exc:
         log["status"], log["error"] = "error", str(exc)
         yield sse({"type": "error", "text": str(exc)})
@@ -1138,83 +1250,6 @@ async def chat_compact(req: CompactRequest):
         headers=headers,
         background=BackgroundTask(chatlog.persist, log),
     )
-
-
-# ---------------------------------------------------------------------------
-# Chat titles. The UI names each saved chat from its first question. It's a
-# tiny grammar-constrained generation on the same model, so it has to share
-# INFERENCE_LOCK with replies: it waits only briefly, and if a reply is in
-# flight it gives up (title: null) and the UI keeps its fallback title rather
-# than making anyone queue behind it.
-# ---------------------------------------------------------------------------
-
-TITLE_SCHEMA = {
-    "type": "object",
-    "properties": {"title": {"type": "string"}},
-    "required": ["title"],
-}
-TITLE_PROMPT = """Write a short title (3 to 6 words) for a chat that starts with the message below. Use the same language as the message. No quotes and no trailing punctuation.
-
-Respond with ONLY a JSON object of this exact shape:
-{{"title": "<the title>"}}
-
-Message: {question}"""
-TITLE_QUESTION_CHARS = 300  # only the opening of a long paste is needed to name a chat
-TITLE_MAX_CHARS = 60
-TITLE_MAX_TOKENS = 40
-TITLE_LOCK_WAIT_S = 3.0
-
-_TITLE_FIELD = re.compile(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)')
-
-
-def clean_title(raw: str) -> str | None:
-    """Pull the title out of the model's JSON. If generation hit the token
-    cap mid-string the JSON is cut off, so fall back to a regex over what
-    was produced before giving up."""
-    try:
-        title = json.loads(raw).get("title", "")
-    except (json.JSONDecodeError, AttributeError):
-        m = _TITLE_FIELD.search(raw)
-        title = m.group(1) if m else ""
-    title = " ".join(str(title).split()).strip(" \"'\u201c\u201d\u2018\u2019`.")
-    return title[:TITLE_MAX_CHARS].strip() or None
-
-
-def generate_title(llm: Llama, question: str) -> str | None:
-    """Runs in a worker thread. None = model busy or no usable output."""
-    if not INFERENCE_LOCK.acquire(timeout=TITLE_LOCK_WAIT_S):
-        return None
-    try:
-        out = llm.create_chat_completion(
-            messages=[{"role": "user", "content": TITLE_PROMPT.format(question=question)}],
-            response_format={"type": "json_object", "schema": TITLE_SCHEMA},
-            temperature=0.3,
-            max_tokens=TITLE_MAX_TOKENS,
-        )
-    finally:
-        INFERENCE_LOCK.release()
-    return clean_title(out["choices"][0]["message"].get("content") or "")
-
-
-class TitleRequest(BaseModel):
-    question: str
-
-
-@app.post("/chat/title", dependencies=[Depends(require_api_key)])
-async def chat_title(req: TitleRequest):
-    llm = STATE.get("llm")
-    if llm is None:
-        raise HTTPException(status_code=503, detail="Model still loading.")
-    question = " ".join(req.question.split())[:TITLE_QUESTION_CHARS]
-    if not question:
-        raise HTTPException(status_code=400, detail="question is empty.")
-    loop = asyncio.get_running_loop()
-    try:
-        title = await loop.run_in_executor(None, generate_title, llm, question)
-    except Exception as exc:  # a title is cosmetic: never surface a 500 for it
-        print(f"[title] generation failed: {exc!r}")
-        title = None
-    return {"title": title}
 
 
 @app.get("/session/init")
