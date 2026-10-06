@@ -1252,6 +1252,83 @@ async def chat_compact(req: CompactRequest):
     )
 
 
+# ---------------------------------------------------------------------------
+# Chat titles. The UI names each saved chat from its first question. It's a
+# tiny grammar-constrained generation on the same model, so it has to share
+# INFERENCE_LOCK with replies: it waits only briefly, and if a reply is in
+# flight it gives up (title: null) and the UI keeps its fallback title rather
+# than making anyone queue behind it.
+# ---------------------------------------------------------------------------
+
+TITLE_SCHEMA = {
+    "type": "object",
+    "properties": {"title": {"type": "string"}},
+    "required": ["title"],
+}
+TITLE_PROMPT = """Write a short title (3 to 6 words) for a chat that starts with the message below. Use the same language as the message. No quotes and no trailing punctuation.
+
+Respond with ONLY a JSON object of this exact shape:
+{{"title": "<the title>"}}
+
+Message: {question}"""
+TITLE_QUESTION_CHARS = 300  # only the opening of a long paste is needed to name a chat
+TITLE_MAX_CHARS = 60
+TITLE_MAX_TOKENS = 40
+TITLE_LOCK_WAIT_S = 3.0
+
+_TITLE_FIELD = re.compile(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)')
+
+
+def clean_title(raw: str) -> str | None:
+    """Pull the title out of the model's JSON. If generation hit the token
+    cap mid-string the JSON is cut off, so fall back to a regex over what
+    was produced before giving up."""
+    try:
+        title = json.loads(raw).get("title", "")
+    except (json.JSONDecodeError, AttributeError):
+        m = _TITLE_FIELD.search(raw)
+        title = m.group(1) if m else ""
+    title = " ".join(str(title).split()).strip(" \"'\u201c\u201d\u2018\u2019`.")
+    return title[:TITLE_MAX_CHARS].strip() or None
+
+
+def generate_title(llm: Llama, question: str) -> str | None:
+    """Runs in a worker thread. None = model busy or no usable output."""
+    if not INFERENCE_LOCK.acquire(timeout=TITLE_LOCK_WAIT_S):
+        return None
+    try:
+        out = llm.create_chat_completion(
+            messages=[{"role": "user", "content": TITLE_PROMPT.format(question=question)}],
+            response_format={"type": "json_object", "schema": TITLE_SCHEMA},
+            temperature=0.3,
+            max_tokens=TITLE_MAX_TOKENS,
+        )
+    finally:
+        INFERENCE_LOCK.release()
+    return clean_title(out["choices"][0]["message"].get("content") or "")
+
+
+class TitleRequest(BaseModel):
+    question: str
+
+
+@app.post("/chat/title", dependencies=[Depends(require_api_key)])
+async def chat_title(req: TitleRequest):
+    llm = STATE.get("llm")
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model still loading.")
+    question = " ".join(req.question.split())[:TITLE_QUESTION_CHARS]
+    if not question:
+        raise HTTPException(status_code=400, detail="question is empty.")
+    loop = asyncio.get_running_loop()
+    try:
+        title = await loop.run_in_executor(None, generate_title, llm, question)
+    except Exception as exc:  # a title is cosmetic: never surface a 500 for it
+        print(f"[title] generation failed: {exc!r}")
+        title = None
+    return {"title": title}
+
+
 @app.get("/session/init")
 async def session_init():
     """The client compares this to what it last saw and stored. A mismatch
