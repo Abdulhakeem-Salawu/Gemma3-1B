@@ -2,13 +2,25 @@ import { useEffect, useState } from "react";
 import { useAuiState } from "@assistant-ui/react";
 import { LoaderCircleIcon } from "lucide-react";
 
+/**
 const MESSAGES = [
   "Thinking…",
   "Reading your question…",
   "Working through it…",
   "Putting the pieces together…",
   "Still working, this one takes a moment…",
+]; */
+
+const MESSAGES = [
+  "Reading your message…",
+  "Getting the full picture…",
+  "Figuring out the best approach…",
+  "Working on it for you…",
+  "Crafting your answer…",
+  "Almost there…",
+  "Finalizing everything now…"
 ];
+
 const INTERVAL_MS = 7000;
 
 /** Spinner + status line. Mounts when the wait begins and unmounts when the
