@@ -20,7 +20,7 @@ import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
 from ddgs import DDGS
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 import chatlog
 import compaction
+import documents as docutil
 
 MODEL_PATH = os.getenv("MODEL_PATH", "/mnt/models/gemma-3-1b-it-q4_0.gguf")
 APP_API_KEY = os.getenv("APP_API_KEY")  # set in production; unset = no auth (local dev only)
@@ -68,6 +69,15 @@ COMPACT_INPUT_MAX_TOKENS = min(
 )
 COMPACT_PROGRESS_SECONDS = 10  # max silence on the /chat/compact stream (also keeps idle-connection timeouts away)
 COMPACT_PROGRESS_TOKENS = 8  # a progress event every this many generated tokens
+
+# --- Documents (see documents.py) ------------------------------------------
+# The browser owns the documents and sends them with every chat request, so any instance can answer.
+# This is the most of the prompt that retrieved document text may take; build_turns lowers it further
+# when the instructions, summary and question leave less room, so documents can never push the prompt
+# past n_ctx.
+DOC_CONTEXT_TOKENS = int(os.getenv("DOC_CONTEXT_TOKENS", "1100" if N_CTX < 6144 else "1800"))
+DOC_HISTORY_RESERVE_TOKENS = 300  # room always kept for chat history next to document text
+MAX_EXTRACT_CHARS = 2_000_000  # pasted text is rejected above this before any processing
 
 STATE: dict[str, Any] = {}
 
@@ -518,6 +528,10 @@ class ChatRequest(BaseModel):
     # neither field behaves exactly as before.
     summary: str | None = None  # model-written summary of the first `summary_covers` messages
     summary_covers: int = 0  # how many leading messages of `messages` the summary already covers
+    # The chat's documents, owned by the client (see documents.py): [{id, name, chunks[], overlaps[], outline[]}].
+    # Absent (an older client): fall back to the in-memory index filled by /kb/upload. Present, even as
+    # an empty list: only these documents are used.
+    documents: list[dict] | None = None
 
 
 def normalize_history(messages: list[dict]) -> list[dict]:
@@ -616,6 +630,7 @@ def build_turns(
     summary: str | None = None,
     summary_covers: int = 0,
     usage: dict | None = None,
+    documents: list[dict] | None = None,
 ) -> list[dict]:
     """Client history -> the turns sent to the model (instructions ride on the
     newest user message). Used by /chat and /chat/stream (now the same
@@ -625,7 +640,10 @@ def build_turns(
     `summary`/`summary_covers` are the client's compaction state, already
     validated by the caller: the first `summary_covers` RAW messages are
     replaced by the summary. If `usage` is given it is filled with what
-    chat_stream needs to report context usage in the `done` event."""
+    chat_stream needs to report context usage in the `done` event.
+
+    `documents` are the chat's client-owned documents, already validated by the caller;
+    when given (even empty) they replace the in-memory index used by older clients."""
     if summary:
         # Slice the RAW list first (before normalize_history merges or drops
         # anything), so the client's indices stay valid.
@@ -635,10 +653,46 @@ def build_turns(
         raise HTTPException(status_code=400, detail="Last message must have role 'user'.")
 
     question = history[-1]["content"]
-    context = retrieve_context(session_id, question)
+    llm = STATE.get("llm")
+    doc_info = None
+    if documents is not None:
+        previous = next((m["content"] for m in reversed(history[:-1]) if m["role"] == "user"), "")
+        doc_budget = DOC_CONTEXT_TOKENS
+        if llm is not None:
+            # Whatever the instructions, summary and question leave, minus the room history always keeps.
+            base = count_tokens(
+                llm,
+                INSTRUCTIONS_TEMPLATE.format(
+                    tools=tool_directory_text(),
+                    context_block="",
+                    summary_rule=compaction.SUMMARY_RULE if summary else "",
+                    summary_block=compaction.format_summary_block(summary) if summary else "",
+                    question=question,
+                ),
+            )
+            room = N_CTX - MAX_GENERATION_TOKENS - PROMPT_MARGIN_TOKENS - base - DOC_HISTORY_RESERVE_TOKENS
+            doc_budget = max(0, min(DOC_CONTEXT_TOKENS, room))
+        doc_info = docutil.select_context(
+            documents,
+            question,
+            prev_question=previous,
+            budget_tokens=doc_budget,
+            count_tokens=(lambda t: count_tokens(llm, t)) if llm is not None else None,
+        )
+        context = doc_info["text"]
+    else:
+        context = retrieve_context(session_id, question)
     if log is not None:
         log["question"] = question
         log["context"] = context
+        if doc_info is not None:  # what the model was shown, for the next log review
+            log.setdefault("extra", {}).update(
+                doc_ids=",".join(doc_info["doc_ids"]),
+                doc_mode=doc_info["mode"],
+                doc_chunks_selected=doc_info["selected"],
+                doc_chunks_total=doc_info["total"],
+                doc_context_tokens=count_tokens(llm, context) if (llm is not None and context) else 0,
+            )
     context_block = f"\nContext from documents uploaded this session:\n{context}\n" if context else ""
     final_turn = {
         "role": "user",
@@ -652,7 +706,6 @@ def build_turns(
     }
     older = history[:-1]  # everything before the newest question, replayed as-is
 
-    llm = STATE.get("llm")
     if llm is not None:
         # n_ctx has to hold the prompt AND the reply, so the prompt may only
         # use what MAX_GENERATION_TOKENS leaves free. Compact, then drop, the
@@ -1045,10 +1098,15 @@ async def chat_stream(req: ChatRequest):
     except ValueError as exc:  # oversized or non-string summary: tell the client, never drop it silently
         raise HTTPException(status_code=400, detail=str(exc))
 
+    try:
+        documents = docutil.validate_documents(req.documents) if req.documents is not None else None
+    except docutil.DocumentError as exc:  # too many / too large / malformed: say so in the UI
+        raise HTTPException(status_code=exc.status, detail=exc.message)
+
     log = chatlog.new_log(MODEL_PATH, INSTANCE_ID, req.session_id)
     usage: dict = {}
     try:
-        turns = build_turns(req.messages, req.session_id, log, summary, covers, usage)
+        turns = build_turns(req.messages, req.session_id, log, summary, covers, usage, documents)
     except PromptTooLong as exc:
         log["status"], log["error"] = "too_long", str(exc)
 
@@ -1063,7 +1121,7 @@ async def chat_stream(req: ChatRequest):
             background=BackgroundTask(chatlog.persist, log),
         )
     if summary:
-        log["extra"] = {"summary_covers": covers, "summary_tokens": usage.get("summary_tokens")}
+        log.setdefault("extra", {}).update(summary_covers=covers, summary_tokens=usage.get("summary_tokens"))
     return StreamingResponse(
         stream_reply(llm, turns, log, make_context_after(llm, req.messages, covers, usage, log)),
         media_type="text/event-stream",
@@ -1329,6 +1387,44 @@ async def chat_title(req: TitleRequest):
     return {"title": title}
 
 
+@app.post("/kb/extract", dependencies=[Depends(require_api_key)])
+async def kb_extract(request: Request):
+    """Stateless: extract, clean and chunk a file (multipart `file`) or pasted text (JSON
+    {text, name}) and return the document for the browser to keep. Nothing is stored here, so
+    it does not matter which instance serves this or the chat requests that follow."""
+    loop = asyncio.get_running_loop()
+    try:
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = await request.json()
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(text, str):
+                raise docutil.DocumentError(400, "text must be a string.")
+            if len(text) > MAX_EXTRACT_CHARS:
+                raise docutil.DocumentError(413, "That text is too large to attach.")
+            name, pages = body.get("name"), None
+        else:
+            form = await request.form()
+            upload = form.get("file")
+            if upload is None or not hasattr(upload, "read"):
+                raise docutil.DocumentError(400, "No file received.")
+            data = await upload.read()
+            if len(data) > MAX_DOC_BYTES:
+                raise docutil.DocumentError(413, "File too large (15 MB max).")
+            name = upload.filename or "Document"
+            text, meta = await loop.run_in_executor(None, docutil.extract_file, name, data)
+            pages = meta.get("pages")
+        doc = await loop.run_in_executor(None, functools.partial(docutil.build_document, name, text, pages=pages))
+        if pages:
+            doc["pages"] = pages
+        return doc
+    except docutil.DocumentError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message)
+    except ValueError as exc:  # unsupported type, or a body that is not JSON
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # a malformed PDF/DOCX shouldn't 500 the request
+        raise HTTPException(status_code=400, detail=f"Could not read that file: {exc}")
+
+
 @app.get("/session/init")
 async def session_init():
     """The client compares this to what it last saw and stored. A mismatch
@@ -1373,7 +1469,12 @@ async def kb_upload(session_id: str, file: UploadFile = File(...)):
         SESSION_DOC_NAMES.setdefault(session_id, []).append(file.filename)
         total = len(index.chunks)
 
-    return {"filename": file.filename, "chunks_added": added, "total_chunks": total}
+    response = {"filename": file.filename, "chunks_added": added, "total_chunks": total}
+    try:  # the document as /kb/extract returns it, so a newer client can use this route too
+        response.update(docutil.build_document(file.filename, text))
+    except docutil.DocumentError:
+        pass  # the old in-memory index above still has it; only the client-owned form is unavailable
+    return response
 
 
 @app.post("/kb/clear", dependencies=[Depends(require_api_key)])
