@@ -2,8 +2,7 @@ import { MenuIcon, MoonIcon, PlusIcon, SunIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChatSession } from "@/components/chat-session";
 import { Sidebar } from "@/components/sidebar";
-import { checkServerRestarted } from "@/lib/session";
-import { invalidateAllDocs, newChat, useSessionStore } from "@/lib/sessions";
+import { newChat, useSessionStore } from "@/lib/sessions";
 import { useAutoTitles } from "@/lib/titles";
 import { cn } from "@/lib/utils";
 
@@ -64,12 +63,6 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const { sessions, activeId, running, busy } = useSessionStore();
   useAutoTitles();
-
-  useEffect(() => {
-    void checkServerRestarted().then((restarted) => {
-      if (restarted) invalidateAllDocs();
-    });
-  }, []);
 
   const closeDrawer = useCallback(() => setDrawerOpen(false), []);
 

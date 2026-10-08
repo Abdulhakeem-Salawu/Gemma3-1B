@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from "react";
 import type { ThreadMessage, ThreadMessageLike } from "@assistant-ui/react";
 import { dropCompaction, LEGACY_SUMMARY_STORAGE, summaryStorageKey } from "./compaction";
-import { getApiKey, newId } from "./session";
+import { deleteSessionDocs } from "./doc-store";
+import { newId } from "./session";
 
 /**
  * Browser-side store for multiple chat sessions.
@@ -13,8 +14,9 @@ import { getApiKey, newId } from "./session";
  *   agent_session_<id>_docs      that chat's uploaded-document chips
  *   agent_session_<id>_summary   that chat's condensed-history summary (lib/compaction)
  *
- * A session's id is also the `session_id` sent to the server, which keys the
- * in-memory document index there — so uploaded documents belong to one chat.
+ * A session's id is also the `session_id` sent to the server (it ties log entries
+ * together) and keys that chat's documents in IndexedDB (lib/doc-store), so
+ * attached documents belong to one chat.
  *
  * A brand-new chat is only a "draft" id until something is actually sent or
  * uploaded; only then does it enter the index, so the sidebar never fills up
@@ -28,13 +30,15 @@ export type SessionMeta = {
   titleSource: "fallback" | "ai";
   /** The first user message (trimmed). Input for the AI title. */
   question: string;
-  /** First turn finished — eligible for an AI title. */
+  /** First turn finished \u2014 eligible for an AI title. */
   replied: boolean;
   createdAt: number;
   updatedAt: number;
 };
 
-export type DocEntry = { name: string; chunks: number };
+/** A chip for one attached document. The text itself is in IndexedDB (lib/doc-store). `id` is the
+ * server's hash of the cleaned text; chips from before documents moved to the browser have none. */
+export type DocEntry = { id?: string; name: string; chunks: number; chars?: number; kind?: "file" | "paste" };
 
 type Snapshot = {
   sessions: readonly SessionMeta[];
@@ -100,7 +104,7 @@ export function fallbackTitle(question: string): string {
   if (flat.length <= FALLBACK_TITLE_CHARS) return flat;
   const cut = flat.slice(0, FALLBACK_TITLE_CHARS);
   const space = cut.lastIndexOf(" ");
-  return `${space > FALLBACK_TITLE_CHARS / 2 ? cut.slice(0, space) : cut}…`;
+  return `${space > FALLBACK_TITLE_CHARS / 2 ? cut.slice(0, space) : cut}\u2026`;
 }
 
 function isMeta(value: unknown): value is SessionMeta {
@@ -121,7 +125,7 @@ let storageFull = false;
 let snapshot: Snapshot;
 
 const docsCache = new Map<string, DocEntry[]>();
-/** Ids deleted in this page load — pending saves for them must not resurrect them. */
+/** Ids deleted in this page load \u2014 pending saves for them must not resurrect them. */
 const deleted = new Set<string>();
 const listeners = new Set<() => void>();
 
@@ -225,7 +229,7 @@ function migrateLegacy() {
       if (legacySummary) localStorage.setItem(summaryStorageKey(legacyId), legacySummary);
       localStorage.setItem(INDEX_KEY, JSON.stringify([meta]));
     } catch {
-      return; // couldn't write — leave the old data untouched and retry next load
+      return; // couldn't write \u2014 leave the old data untouched and retry next load
     }
   }
   remove(LEGACY_HISTORY);
@@ -259,7 +263,8 @@ export function useSessionDocs(id: string): DocEntry[] {
 export function getDocs(id: string): DocEntry[] {
   let docs = docsCache.get(id);
   if (!docs) {
-    docs = readJson<DocEntry[]>(docsKey(id), []);
+    // Chips from before documents moved to the browser have no id and no stored text: drop them.
+    docs = readJson<DocEntry[]>(docsKey(id), []).filter((d) => typeof d.id === "string");
     docsCache.set(id, docs);
   }
   return docs;
@@ -294,16 +299,6 @@ export function setDocs(id: string, docs: DocEntry[]) {
   docsCache.set(id, docs);
   if (docs.length > 0) ensureSession(id);
   write(docsKey(id), JSON.stringify(docs));
-  emit();
-}
-
-/** A server restart loses every session's uploaded documents; messages stay. */
-export function invalidateAllDocs() {
-  const ids = new Set([...sessions.map((s) => s.id), ...docsCache.keys()]);
-  for (const id of ids) {
-    docsCache.set(id, []);
-    remove(docsKey(id));
-  }
   emit();
 }
 
@@ -398,7 +393,6 @@ export function newChat() {
 }
 
 export function deleteSession(id: string) {
-  const hadDocs = getDocs(id).length > 0;
   deleted.add(id);
   sessions = sessions.filter((s) => s.id !== id);
   running = running.filter((r) => r !== id);
@@ -413,15 +407,6 @@ export function deleteSession(id: string) {
     persistActive();
   }
   emit();
-  // Only worth a request (which could wake a scaled-to-zero instance) if the
-  // server may actually hold documents for this session.
-  if (hadDocs) {
-    void fetch("/kb/clear", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": getApiKey() },
-      body: JSON.stringify({ session_id: id }),
-    }).catch(() => {
-      // best effort — the server drops it on its next restart anyway
-    });
-  }
+  // The chat's documents live in this browser only; nothing to clean up on the server.
+  void deleteSessionDocs(id).catch(() => undefined);
 }

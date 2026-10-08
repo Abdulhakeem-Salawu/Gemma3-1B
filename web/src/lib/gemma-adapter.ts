@@ -6,6 +6,7 @@ import type {
   ToolCallMessagePart,
 } from "@assistant-ui/react";
 import { compactConversation, summaryPayload, toHistory, type ContextInfo } from "./compaction";
+import { loadDocumentsPayload, noteMessageSent } from "./documents";
 import { getApiKey } from "./session";
 import { getOtherRunningId } from "./sessions";
 
@@ -57,18 +58,29 @@ export function createGemmaChatAdapter(sessionId: string): ChatModelAdapter {
       }
 
       const history = toHistory(messages);
+      noteMessageSent(sessionId);
+      // The chat's documents ride along with every request (always an array, empty when none are
+      // attached), so any server instance can answer; nothing depends on which one saw the upload.
+      const documents = await loadDocumentsPayload(sessionId);
 
       // After a compaction the server gets the summary plus the full raw list;
       // `summary_covers` says how many leading messages the summary replaces.
       const res = await fetch("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": getApiKey() },
-        body: JSON.stringify({ messages: history, session_id: sessionId, ...summaryPayload(sessionId, history) }),
+        body: JSON.stringify({ messages: history, session_id: sessionId, documents, ...summaryPayload(sessionId, history) }),
         signal: abortSignal,
       });
 
       if (!res.ok || !res.body) {
-        const detail = await res.text().catch(() => "");
+        const raw = await res.text().catch(() => "");
+        let detail = raw;
+        try {
+          const body = JSON.parse(raw);
+          if (typeof body.detail === "string") detail = body.detail; // e.g. a document over the size limit
+        } catch {
+          // not JSON: show the raw text
+        }
         const message =
           res.status === 401
             ? "Wrong API key."
@@ -95,7 +107,7 @@ export function createGemmaChatAdapter(sessionId: string): ChatModelAdapter {
             break;
           }
           case "thinking_done": {
-            reasoningIdx = null; // seals it — a later hop's thinking starts a fresh block
+            reasoningIdx = null; // seals it \u2014 a later hop's thinking starts a fresh block
             break;
           }
           case "tool": {
