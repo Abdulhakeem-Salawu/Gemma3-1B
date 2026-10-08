@@ -206,7 +206,7 @@ async function keep(sessionId: string, ex: Extracted, kind: "file" | "paste"): P
 // ---------------------------------------------------------------------------
 
 export function attachFile(sessionId: string, file: File): Promise<AttachResult> {
-  return withReading(sessionId, `Reading ${file.name}\u2026`, async () => {
+  return withReading(sessionId, `Reading ${file.name}…`, async () => {
     let result: AttachResult;
     try {
       const form = new FormData();
@@ -224,7 +224,7 @@ export function attachFile(sessionId: string, file: File): Promise<AttachResult>
 /** A long paste becomes a document. On failure the caller puts the text back in the box. */
 export function attachPastedText(sessionId: string, text: string): Promise<AttachResult> {
   const name = pasteName(text);
-  return withReading(sessionId, "Reading pasted text\u2026", async () => {
+  return withReading(sessionId, "Reading pasted text…", async () => {
     let result: AttachResult;
     try {
       const ex = await postExtract({
