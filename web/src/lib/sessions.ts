@@ -30,7 +30,7 @@ export type SessionMeta = {
   titleSource: "fallback" | "ai";
   /** The first user message (trimmed). Input for the AI title. */
   question: string;
-  /** First turn finished \u2014 eligible for an AI title. */
+  /** First turn finished — eligible for an AI title. */
   replied: boolean;
   createdAt: number;
   updatedAt: number;
@@ -104,7 +104,7 @@ export function fallbackTitle(question: string): string {
   if (flat.length <= FALLBACK_TITLE_CHARS) return flat;
   const cut = flat.slice(0, FALLBACK_TITLE_CHARS);
   const space = cut.lastIndexOf(" ");
-  return `${space > FALLBACK_TITLE_CHARS / 2 ? cut.slice(0, space) : cut}\u2026`;
+  return `${space > FALLBACK_TITLE_CHARS / 2 ? cut.slice(0, space) : cut}…`;
 }
 
 function isMeta(value: unknown): value is SessionMeta {
@@ -125,7 +125,7 @@ let storageFull = false;
 let snapshot: Snapshot;
 
 const docsCache = new Map<string, DocEntry[]>();
-/** Ids deleted in this page load \u2014 pending saves for them must not resurrect them. */
+/** Ids deleted in this page load — pending saves for them must not resurrect them. */
 const deleted = new Set<string>();
 const listeners = new Set<() => void>();
 
@@ -229,7 +229,7 @@ function migrateLegacy() {
       if (legacySummary) localStorage.setItem(summaryStorageKey(legacyId), legacySummary);
       localStorage.setItem(INDEX_KEY, JSON.stringify([meta]));
     } catch {
-      return; // couldn't write \u2014 leave the old data untouched and retry next load
+      return; // couldn't write — leave the old data untouched and retry next load
     }
   }
   remove(LEGACY_HISTORY);

@@ -107,7 +107,7 @@ export function createGemmaChatAdapter(sessionId: string): ChatModelAdapter {
             break;
           }
           case "thinking_done": {
-            reasoningIdx = null; // seals it \u2014 a later hop's thinking starts a fresh block
+            reasoningIdx = null; // seals it — a later hop's thinking starts a fresh block
             break;
           }
           case "tool": {

@@ -41,12 +41,12 @@ export function Composer({ sessionId, blockedBy }: { sessionId: string; blockedB
           onPaste={onPaste}
           placeholder={
             reading
-              ? "Reading the attachment\u2026"
+              ? "Reading the attachment…"
               : condensing
-                ? "Condensing the conversation\u2026"
+                ? "Condensing the conversation…"
                 : blocked
-                  ? `Waiting for \u201c${blockedBy}\u201d to finish replying\u2026`
-                  : "Ask something\u2026"
+                  ? `Waiting for “${blockedBy}” to finish replying…`
+                  : "Ask something…"
           }
           className="max-h-40 flex-1 resize-none rounded-2xl border border-[var(--line)] bg-[var(--bg-soft)] px-4 py-2.5 text-[15px] leading-relaxed text-[var(--fg)] placeholder:text-[var(--fg-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-60"
         />
